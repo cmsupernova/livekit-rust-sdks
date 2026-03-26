@@ -1511,6 +1511,13 @@ impl SessionInner {
             matched.append(&mut partial_matched);
 
             transceiver.set_codec_preferences(matched)?;
+
+            if options.source == crate::room::track::TrackSource::Screenshare {
+                let sender = transceiver.sender();
+                let mut params = sender.parameters();
+                params.degradation_preference = Some(DegradationPreference::MaintainResolution);
+                let _ = sender.set_parameters(params);
+            }
         }
 
         Ok(transceiver)

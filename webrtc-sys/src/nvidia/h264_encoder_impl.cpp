@@ -436,11 +436,33 @@ void NvidiaH264EncoderImpl::SetRates(
     return;
   }
 
-  codec_.maxFramerate = static_cast<uint32_t>(parameters.framerate_fps);
-  codec_.maxBitrate = parameters.bitrate.GetSpatialLayerSum(0);
+  uint32_t new_target_bps = parameters.bitrate.GetSpatialLayerSum(0);
+  uint32_t new_framerate = static_cast<uint32_t>(parameters.framerate_fps);
 
-  configuration_.target_bps = parameters.bitrate.GetSpatialLayerSum(0);
+  codec_.maxFramerate = new_framerate;
+  codec_.maxBitrate = new_target_bps;
+  configuration_.target_bps = new_target_bps;
   configuration_.max_frame_rate = parameters.framerate_fps;
+
+  nv_encode_config_.rcParams.averageBitRate = new_target_bps;
+  nv_encode_config_.rcParams.maxBitRate = new_target_bps;
+  nv_encode_config_.rcParams.vbvBufferSize =
+      (new_target_bps * nv_initialize_params_.frameRateDen /
+       nv_initialize_params_.frameRateNum) * 5;
+  nv_encode_config_.rcParams.vbvInitialDelay =
+      nv_encode_config_.rcParams.vbvBufferSize;
+  nv_initialize_params_.frameRateNum = new_framerate;
+  nv_initialize_params_.frameRateDen = 1;
+
+  NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {};
+  reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+  reconfigure_params.reInitEncodeParams = nv_initialize_params_;
+
+  try {
+    encoder_->Reconfigure(&reconfigure_params);
+  } catch (const NVENCException& e) {
+    RTC_LOG(LS_ERROR) << "NVENC reconfigure failed: " << e.what();
+  }
 
   if (configuration_.target_bps) {
     configuration_.SetStreamState(true);
