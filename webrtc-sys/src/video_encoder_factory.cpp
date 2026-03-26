@@ -45,6 +45,10 @@
 #include "vaapi/vaapi_encoder_factory.h"
 #endif
 
+#if defined(USE_MFT_VIDEO_CODEC)
+#include "mft/mft_encoder_factory.h"
+#endif
+
 namespace livekit_ffi {
 
 using Factory = webrtc::VideoEncoderFactoryTemplate<
@@ -70,6 +74,12 @@ VideoEncoderFactory::InternalFactory::InternalFactory() {
   if (webrtc::NvidiaVideoEncoderFactory::IsSupported()) {
     factories_.push_back(std::make_unique<webrtc::NvidiaVideoEncoderFactory>());
   } else {
+#endif
+
+#if defined(USE_MFT_VIDEO_CODEC)
+    if (webrtc::MftVideoEncoderFactory::IsSupported()) {
+      factories_.push_back(std::make_unique<webrtc::MftVideoEncoderFactory>());
+    }
 #endif
 
 #if defined(USE_VAAPI_VIDEO_CODEC)
