@@ -154,7 +154,9 @@ fn main() {
             );
             let cuda_include_dir = cuda_home.join("include");
 
-            if cuda_include_dir.join("cuda.h").exists() {
+            let cuda_lib_dir = cuda_home.join("lib").join("x64");
+
+            if cuda_include_dir.join("cuda.h").exists() && cuda_lib_dir.join("cuda.lib").exists() {
                 builder
                     .include(&cuda_include_dir)
                     .include("src/nvidia/NvCodec/include")
@@ -172,6 +174,20 @@ fn main() {
                     .define("USE_NVIDIA_VIDEO_CODEC", "1")
                     .flag("/wd4996")
                     .flag("/wd4819");
+
+                println!("cargo:rustc-link-search=native={}", cuda_lib_dir.to_str().unwrap());
+                println!("cargo:rustc-link-lib=cuda");
+
+                let nvcuvid_lib = Path::new("src/nvidia/nvcuvid.lib");
+                if nvcuvid_lib.exists() {
+                    let nvcuvid_dir = std::fs::canonicalize(nvcuvid_lib.parent().unwrap()).unwrap();
+                    println!("cargo:rustc-link-search=native={}", nvcuvid_dir.to_str().unwrap());
+                    println!("cargo:rustc-link-lib=nvcuvid");
+                    println!("cargo:rustc-link-arg=/DELAYLOAD:nvcuvid.dll");
+                }
+
+                println!("cargo:rustc-link-lib=delayimp");
+                println!("cargo:rustc-link-arg=/DELAYLOAD:nvcuda.dll");
             } else {
                 println!("cargo:warning=CUDA not found at {}; building without NVIDIA hardware encoding", cuda_home.display());
             }

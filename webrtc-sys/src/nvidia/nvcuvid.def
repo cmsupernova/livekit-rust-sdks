@@ -1,0 +1,15 @@
+LIBRARY nvcuvid.dll
+EXPORTS
+    cuvidGetDecoderCaps
+    cuvidCreateDecoder
+    cuvidDestroyDecoder
+    cuvidDecodePicture
+    cuvidGetDecodeStatus
+    cuvidReconfigureDecoder
+    cuvidMapVideoFrame64
+    cuvidUnmapVideoFrame64
+    cuvidCtxLockCreate
+    cuvidCtxLockDestroy
+    cuvidCreateVideoParser
+    cuvidParseVideoData
+    cuvidDestroyVideoParser
