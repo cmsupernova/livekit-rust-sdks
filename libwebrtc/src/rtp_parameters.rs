@@ -29,11 +29,20 @@ pub struct RtpHeaderExtensionParameters {
     pub encrypted: bool,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DegradationPreference {
+    Disabled,
+    MaintainFramerate,
+    MaintainResolution,
+    Balanced,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RtpParameters {
     pub codecs: Vec<RtpCodecParameters>,
     pub header_extensions: Vec<RtpHeaderExtensionParameters>,
     pub rtcp: RtcpParameters,
+    pub degradation_preference: Option<DegradationPreference>,
 }
 
 #[derive(Debug, Clone, Default)]

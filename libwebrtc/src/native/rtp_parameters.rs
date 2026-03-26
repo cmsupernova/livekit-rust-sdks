@@ -34,12 +34,40 @@ impl From<sys_rp::ffi::RtpExtension> for RtpHeaderExtensionParameters {
     }
 }
 
+impl From<sys_rp::ffi::DegradationPreference> for DegradationPreference {
+    fn from(value: sys_rp::ffi::DegradationPreference) -> Self {
+        match value {
+            sys_rp::ffi::DegradationPreference::Disabled => Self::Disabled,
+            sys_rp::ffi::DegradationPreference::MaintainFramerate => Self::MaintainFramerate,
+            sys_rp::ffi::DegradationPreference::MaintainResolution => Self::MaintainResolution,
+            sys_rp::ffi::DegradationPreference::Balanced => Self::Balanced,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+impl From<DegradationPreference> for sys_rp::ffi::DegradationPreference {
+    fn from(value: DegradationPreference) -> Self {
+        match value {
+            DegradationPreference::Disabled => Self::Disabled,
+            DegradationPreference::MaintainFramerate => Self::MaintainFramerate,
+            DegradationPreference::MaintainResolution => Self::MaintainResolution,
+            DegradationPreference::Balanced => Self::Balanced,
+        }
+    }
+}
+
 impl From<sys_rp::ffi::RtpParameters> for RtpParameters {
     fn from(value: sys_rp::ffi::RtpParameters) -> Self {
         Self {
             codecs: value.codecs.into_iter().map(Into::into).collect(),
             header_extensions: value.header_extensions.into_iter().map(Into::into).collect(),
             rtcp: value.rtcp.into(),
+            degradation_preference: if value.has_degradation_preference {
+                Some(value.degradation_preference.into())
+            } else {
+                None
+            },
         }
     }
 }
@@ -146,8 +174,11 @@ impl From<RtpParameters> for sys_rp::ffi::RtpParameters {
             rtcp: value.rtcp.into(),
             transaction_id: "".to_string(),
             mid: "".to_string(),
-            has_degradation_preference: false,
-            degradation_preference: sys_rp::ffi::DegradationPreference::Balanced,
+            has_degradation_preference: value.degradation_preference.is_some(),
+            degradation_preference: value
+                .degradation_preference
+                .map(Into::into)
+                .unwrap_or(sys_rp::ffi::DegradationPreference::Balanced),
         }
     }
 }
