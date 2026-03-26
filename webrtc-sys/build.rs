@@ -142,22 +142,42 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=dwmapi");
             println!("cargo:rustc-link-lib=dylib=shcore");
 
-            //let path = env::current_dir().unwrap();
-            //println!("cargo:rustc-link-search=native={}/vaapi-windows/x64/lib", path.display());
-            //println!("cargo:rustc-link-lib=dylib=va");
-            //println!("cargo:rustc-link-lib=dylib=va_win32");
+            println!("cargo:rerun-if-env-changed=CUDA_PATH");
+            println!("cargo:rerun-if-env-changed=CUDA_HOME");
+
+            let cuda_home = PathBuf::from(
+                env::var("CUDA_PATH")
+                    .or_else(|_| env::var("CUDA_HOME"))
+                    .unwrap_or_else(|_| {
+                        "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6".to_owned()
+                    }),
+            );
+            let cuda_include_dir = cuda_home.join("include");
+
+            if cuda_include_dir.join("cuda.h").exists() {
+                builder
+                    .include(&cuda_include_dir)
+                    .include("src/nvidia/NvCodec/include")
+                    .include("src/nvidia/NvCodec/NvCodec")
+                    .file("src/nvidia/NvCodec/NvCodec/NvDecoder/NvDecoder.cpp")
+                    .file("src/nvidia/NvCodec/NvCodec/NvEncoder/NvEncoder.cpp")
+                    .file("src/nvidia/NvCodec/NvCodec/NvEncoder/NvEncoderCuda.cpp")
+                    .file("src/nvidia/h264_encoder_impl.cpp")
+                    .file("src/nvidia/h265_encoder_impl.cpp")
+                    .file("src/nvidia/h264_decoder_impl.cpp")
+                    .file("src/nvidia/h265_decoder_impl.cpp")
+                    .file("src/nvidia/nvidia_decoder_factory.cpp")
+                    .file("src/nvidia/nvidia_encoder_factory.cpp")
+                    .file("src/nvidia/cuda_context.cpp")
+                    .define("USE_NVIDIA_VIDEO_CODEC", "1")
+                    .flag("/wd4996")
+                    .flag("/wd4819");
+            } else {
+                println!("cargo:warning=CUDA not found at {}; building without NVIDIA hardware encoding", cuda_home.display());
+            }
 
             builder
-                //.include("./vaapi-windows/DirectX-Headers-1.0/include")
-                //.include(path::PathBuf::from("./vaapi-windows/x64/include"))
-                //.file("vaapi-windows/DirectX-Headers-1.0/src/dxguids.cpp")
-                //.file("src/vaapi/vaapi_display_win32.cpp")
-                //.file("src/vaapi/vaapi_h264_encoder_wrapper.cpp")
-                //.file("src/vaapi/vaapi_encoder_factory.cpp")
-                //.file("src/vaapi/h264_encoder_impl.cpp")
                 .flag("/std:c++20")
-                //.flag("/wd4819")
-                //.flag("/wd4068")
                 .flag("/EHsc");
         }
         "linux" => {
