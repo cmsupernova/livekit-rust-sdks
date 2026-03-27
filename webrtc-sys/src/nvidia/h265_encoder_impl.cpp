@@ -19,6 +19,7 @@
 #include "rtc_base/time_utils.h"
 #include "system_wrappers/include/metrics.h"
 #include "third_party/libyuv/include/libyuv/convert.h"
+#include "third_party/libyuv/include/libyuv/planar_functions.h"
 #include "third_party/libyuv/include/libyuv/scale.h"
 
 namespace webrtc {
@@ -213,16 +214,44 @@ int32_t NvidiaH265EncoderImpl::Encode(
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
   }
 
-  webrtc::scoped_refptr<I420BufferInterface> frame_buffer =
-      input_frame.video_frame_buffer()->ToI420();
-  if (!frame_buffer) {
-    RTC_LOG(LS_ERROR) << "Failed to convert "
-                      << VideoFrameBufferTypeToString(
-                             input_frame.video_frame_buffer()->type())
-                      << " image to I420. Can't encode frame.";
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+  const void* nv12_src = nullptr;
+  uint32_t nv12_stride = 0;
+  std::vector<uint8_t> nv12_tmp;
+
+  auto* vfb = input_frame.video_frame_buffer().get();
+  const int w = input_frame.width();
+  const int h = input_frame.height();
+
+  if (vfb->type() == VideoFrameBuffer::Type::kNV12) {
+    auto nv12_ref = vfb->GetNV12();
+    if (nv12_ref) {
+      nv12_src = nv12_ref->DataY();
+      nv12_stride = nv12_ref->StrideY();
+    }
   }
-  RTC_CHECK(frame_buffer->type() == VideoFrameBuffer::Type::kI420);
+
+  if (!nv12_src) {
+    auto i420 = vfb->ToI420();
+    if (!i420) {
+      RTC_LOG(LS_ERROR) << "Failed to convert "
+                        << VideoFrameBufferTypeToString(vfb->type())
+                        << " to I420 for NV12 encode.";
+      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    }
+    nv12_stride = w;
+    int y_size = w * h;
+    int chroma_h = (h + 1) / 2;
+    int uv_size = w * chroma_h;
+    nv12_tmp.resize(y_size + uv_size);
+
+    libyuv::CopyPlane(i420->DataY(), i420->StrideY(),
+                       nv12_tmp.data(), w, w, h);
+    libyuv::MergeUVPlane(i420->DataU(), i420->StrideU(),
+                          i420->DataV(), i420->StrideV(),
+                          nv12_tmp.data() + y_size, w,
+                          (w + 1) / 2, chroma_h);
+    nv12_src = nv12_tmp.data();
+  }
 
   bool is_keyframe_needed = false;
   if (configuration_.key_frame_request && configuration_.sending) {
@@ -236,9 +265,6 @@ int32_t NvidiaH265EncoderImpl::Encode(
     is_keyframe_needed = true;
     configuration_.key_frame_request = false;
   }
-
-  RTC_DCHECK_EQ(configuration_.width, frame_buffer->width());
-  RTC_DCHECK_EQ(configuration_.height, frame_buffer->height());
 
   if (!configuration_.sending) {
     return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
@@ -255,9 +281,9 @@ int32_t NvidiaH265EncoderImpl::Encode(
 
     if (cu_memory_type_ == CU_MEMORYTYPE_DEVICE) {
       NvEncoderCuda::CopyToDeviceFrame(
-          cu_context_, (void*)frame_buffer->DataY(), frame_buffer->StrideY(),
+          cu_context_, (void*)nv12_src, nv12_stride,
           reinterpret_cast<CUdeviceptr>(nv_enc_input_frame->inputPtr),
-          nv_enc_input_frame->pitch, input_frame.width(), input_frame.height(),
+          nv_enc_input_frame->pitch, w, h,
           CU_MEMORYTYPE_HOST, nv_enc_input_frame->bufferFormat,
           nv_enc_input_frame->chromaOffsets, nv_enc_input_frame->numChromaPlanes);
     }
@@ -302,7 +328,7 @@ int32_t NvidiaH265EncoderImpl::ProcessEncodedFrame(
   encoded_image_.ntp_time_ms_ = inputFrame.ntp_time_ms();
   encoded_image_.capture_time_ms_ = inputFrame.render_time_ms();
   encoded_image_.rotation_ = inputFrame.rotation();
-  encoded_image_.content_type_ = VideoContentType::UNSPECIFIED;
+  encoded_image_.content_type_ = VideoContentType::SCREENSHARE;
   encoded_image_.timing_.flags = VideoSendTiming::kInvalid;
   encoded_image_._frameType =
       current_encoding_is_keyframe_ ? VideoFrameType::kVideoFrameKey
@@ -335,7 +361,7 @@ VideoEncoder::EncoderInfo NvidiaH265EncoderImpl::GetEncoderInfo() const {
   info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
   info.is_hardware_accelerated = true;
   info.supports_simulcast = false;
-  info.preferred_pixel_formats = {VideoFrameBuffer::Type::kI420};
+  info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNV12, VideoFrameBuffer::Type::kI420};
   return info;
 }
 
