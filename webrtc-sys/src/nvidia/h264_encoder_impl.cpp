@@ -224,13 +224,11 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   nv_encode_config_.rcParams.version = NV_ENC_RC_PARAMS_VER;
   nv_encode_config_.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
   nv_encode_config_.rcParams.averageBitRate = configuration_.target_bps;
-  nv_encode_config_.rcParams.vbvBufferSize =
-      (nv_encode_config_.rcParams.averageBitRate *
-       nv_initialize_params_.frameRateDen /
-       nv_initialize_params_.frameRateNum) *
-      5;
+  nv_encode_config_.rcParams.maxBitRate =
+      configuration_.target_bps + configuration_.target_bps / 4;
+  nv_encode_config_.rcParams.vbvBufferSize = configuration_.target_bps;
   nv_encode_config_.rcParams.vbvInitialDelay =
-      nv_encode_config_.rcParams.vbvBufferSize;
+      nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
 
   try {
     encoder_->CreateEncoder(&nv_initialize_params_);
@@ -470,12 +468,11 @@ void NvidiaH264EncoderImpl::SetRates(
   configuration_.max_frame_rate = parameters.framerate_fps;
 
   nv_encode_config_.rcParams.averageBitRate = new_target_bps;
-  nv_encode_config_.rcParams.maxBitRate = new_target_bps;
-  nv_encode_config_.rcParams.vbvBufferSize =
-      (new_target_bps * nv_initialize_params_.frameRateDen /
-       nv_initialize_params_.frameRateNum) * 5;
+  nv_encode_config_.rcParams.maxBitRate =
+      new_target_bps + new_target_bps / 4;  // 125% headroom for transients
+  nv_encode_config_.rcParams.vbvBufferSize = new_target_bps;  // 1 second of buffering
   nv_encode_config_.rcParams.vbvInitialDelay =
-      nv_encode_config_.rcParams.vbvBufferSize;
+      nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
   nv_initialize_params_.frameRateNum = new_framerate;
   nv_initialize_params_.frameRateDen = 1;
 
