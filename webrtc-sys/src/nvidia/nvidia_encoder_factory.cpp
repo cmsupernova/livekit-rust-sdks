@@ -62,14 +62,14 @@ std::unique_ptr<VideoEncoder> NvidiaVideoEncoderFactory::Create(
         RTC_LOG(LS_INFO) << "Using NVIDIA HW encoder (NVENC) for H264";
         return std::make_unique<NvidiaH264EncoderImpl>(
             env, cu_context_->GetContext(), CU_MEMORYTYPE_DEVICE,
-            NV_ENC_BUFFER_FORMAT_IYUV, format);
+            NV_ENC_BUFFER_FORMAT_NV12, format);
       }
 
       if (format.name == "H265" || format.name == "HEVC") {
         RTC_LOG(LS_INFO) << "Using NVIDIA HW encoder (NVENC) for H265/HEVC";
         return std::make_unique<NvidiaH265EncoderImpl>(
             env, cu_context_->GetContext(), CU_MEMORYTYPE_DEVICE,
-            NV_ENC_BUFFER_FORMAT_IYUV, format);
+            NV_ENC_BUFFER_FORMAT_NV12, format);
       }
     }
   }
