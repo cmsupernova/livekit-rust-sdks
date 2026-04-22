@@ -10,8 +10,12 @@
 namespace webrtc {
 
 NvidiaVideoEncoderFactory::NvidiaVideoEncoderFactory() {
+  // Constrained Baseline, Level 5.2: max 4096x2304@30fps / 2560x1440@60fps / 240 Mbps.
+  // Needed because Rift's Forge tier allows up to 2560x1440 screenshare and 1920x1080
+  // camera, which would otherwise be rejected by the Level 3.1 cap in `42e01f`.
+  // NvidiaH264EncoderImpl reads this string and passes the level down to NVENC.
   std::map<std::string, std::string> baselineParameters = {
-      {"profile-level-id", "42e01f"},
+      {"profile-level-id", "42e034"},
       {"level-asymmetry-allowed", "1"},
       {"packetization-mode", "1"},
   };

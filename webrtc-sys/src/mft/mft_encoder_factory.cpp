@@ -41,8 +41,13 @@ static bool HasHardwareH264Mft() {
 }
 
 MftVideoEncoderFactory::MftVideoEncoderFactory() {
+  // Constrained Baseline, Level 5.2 — matches the Nvidia factory so MFT fallback
+  // can negotiate the same higher resolutions (up to 2560x1440 @ 60fps) that
+  // Rift's Forge tier advertises. MFT does not read profile-level-id directly
+  // (it auto-negotiates via MF_MT_FRAME_SIZE), but the SDP answer needs Level 5.2
+  // for the browser/peer to accept large resolutions.
   std::map<std::string, std::string> baselineParameters = {
-      {"profile-level-id", "42e01f"},
+      {"profile-level-id", "42e034"},
       {"level-asymmetry-allowed", "1"},
       {"packetization-mode", "1"},
   };
