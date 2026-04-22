@@ -371,11 +371,11 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
             subtype == MFVideoFormat_H264) {
           UINT32 header_size = 0;
           if (SUCCEEDED(new_output_type->GetBlobSize(
-                  MF_MT_MPEG2_SEQUENCE_HEADER, &header_size)) &&
+                  MF_MT_MPEG_SEQUENCE_HEADER, &header_size)) &&
               header_size > 0) {
             sequence_header_.resize(header_size);
             if (SUCCEEDED(new_output_type->GetBlob(
-                    MF_MT_MPEG2_SEQUENCE_HEADER, sequence_header_.data(),
+                    MF_MT_MPEG_SEQUENCE_HEADER, sequence_header_.data(),
                     header_size, nullptr))) {
               captured_header = true;
               RTC_LOG(LS_INFO)

@@ -66,7 +66,7 @@ class MftH264EncoderImpl : public VideoEncoder {
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
 
-  // Cached SPS+PPS byte-stream captured from MF_MT_MPEG2_SEQUENCE_HEADER on
+  // Cached SPS+PPS byte-stream captured from MF_MT_MPEG_SEQUENCE_HEADER on
   // the first MF_E_TRANSFORM_STREAM_CHANGE event. Prepended to every IDR
   // frame whose bitstream doesn't already carry parameter sets inline, so
   // receivers can actually initialize their H264 decoders (without this,
