@@ -269,7 +269,11 @@ int32_t MftH264EncoderImpl::Encode(
     VARIANT val;
     VariantInit(&val);
     val.vt = VT_UI4;
-    val.ulVal = 0;
+    // CODECAPI_AVEncVideoForceKeyFrame takes a VT_UI4 interpreted as a
+    // boolean: 1 = force the next frame to be a keyframe, 0 = do nothing.
+    // Previously this was 0, making every PLI/FIR-triggered keyframe
+    // request a no-op and leaving receivers stuck on missed IDRs.
+    val.ulVal = 1;
     codec_api_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &val);
   }
 
@@ -345,7 +349,58 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
       break;
 
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-      ConfigureOutputType();
+      // The encoder has finalized its output format and is telling us what
+      // SPS+PPS it will use. We must (a) accept the new output type so the
+      // MFT actually starts producing samples, and (b) cache the sequence
+      // header blob so we can prepend it to every IDR below — many MFT
+      // implementations (Intel QuickSync, AMD VCE, the NVENC-over-MFT shim)
+      // do NOT inline SPS/PPS in the bitstream by default, and without them
+      // the receiver cannot initialize its decoder and shows a black frame
+      // for the entire session.
+      bool captured_header = false;
+      DWORD type_index = 0;
+      while (true) {
+        Microsoft::WRL::ComPtr<IMFMediaType> new_output_type;
+        HRESULT gt_hr = transform_->GetOutputAvailableType(
+            output_stream_id_, type_index, new_output_type.GetAddressOf());
+        if (FAILED(gt_hr))
+          break;
+
+        GUID subtype = {};
+        if (SUCCEEDED(new_output_type->GetGUID(MF_MT_SUBTYPE, &subtype)) &&
+            subtype == MFVideoFormat_H264) {
+          UINT32 header_size = 0;
+          if (SUCCEEDED(new_output_type->GetBlobSize(
+                  MF_MT_MPEG2_SEQUENCE_HEADER, &header_size)) &&
+              header_size > 0) {
+            sequence_header_.resize(header_size);
+            if (SUCCEEDED(new_output_type->GetBlob(
+                    MF_MT_MPEG2_SEQUENCE_HEADER, sequence_header_.data(),
+                    header_size, nullptr))) {
+              captured_header = true;
+              RTC_LOG(LS_INFO)
+                  << "MFT captured SPS+PPS sequence header (" << header_size
+                  << " bytes) for IDR prepend.";
+            } else {
+              sequence_header_.clear();
+            }
+          }
+          if (FAILED(transform_->SetOutputType(output_stream_id_,
+                                                new_output_type.Get(), 0))) {
+            RTC_LOG(LS_WARNING) << "MFT SetOutputType (post stream change) "
+                                   "failed; falling back to ConfigureOutputType.";
+            ConfigureOutputType();
+          }
+          break;
+        }
+        type_index++;
+      }
+      if (!captured_header && sequence_header_.empty()) {
+        RTC_LOG(LS_WARNING)
+            << "MFT stream change did not yield an SPS+PPS header blob; "
+               "decoders may be unable to initialize until a subsequent "
+               "stream change delivers one.";
+      }
       continue;
     }
 
@@ -390,6 +445,7 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
     encoded_image_._frameType = VideoFrameType::kVideoFrameDelta;
     encoded_image_.SetColorSpace(input_frame.color_space());
 
+    bool has_inline_sps = false;
     auto nalu_indices =
         H264::FindNaluIndices(MakeArrayView(data, data_length));
     for (const auto& nalu : nalu_indices) {
@@ -397,13 +453,34 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
           H264::ParseNaluType(data[nalu.payload_start_offset]);
       if (nalu_type == H264::kIdr) {
         encoded_image_._frameType = VideoFrameType::kVideoFrameKey;
-        break;
+      } else if (nalu_type == H264::kSps) {
+        has_inline_sps = true;
       }
     }
 
-    encoded_image_.SetEncodedData(
-        EncodedImageBuffer::Create(data, data_length));
-    encoded_image_.set_size(data_length);
+    // If this is an IDR without inline parameter sets, prepend the cached
+    // SPS+PPS sequence header so the receiver's decoder can initialize.
+    // Non-IDR frames and IDRs that already carry SPS inline pass through
+    // unchanged.
+    const bool should_prepend_header =
+        encoded_image_._frameType == VideoFrameType::kVideoFrameKey &&
+        !has_inline_sps && !sequence_header_.empty();
+
+    if (should_prepend_header) {
+      std::vector<uint8_t> combined;
+      combined.reserve(sequence_header_.size() +
+                       static_cast<size_t>(data_length));
+      combined.insert(combined.end(), sequence_header_.begin(),
+                      sequence_header_.end());
+      combined.insert(combined.end(), data, data + data_length);
+      encoded_image_.SetEncodedData(
+          EncodedImageBuffer::Create(combined.data(), combined.size()));
+      encoded_image_.set_size(combined.size());
+    } else {
+      encoded_image_.SetEncodedData(
+          EncodedImageBuffer::Create(data, data_length));
+      encoded_image_.set_size(data_length);
+    }
     result_buffer->Unlock();
 
     h264_bitstream_parser_.ParseBitstream(encoded_image_);

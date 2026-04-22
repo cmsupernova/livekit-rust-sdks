@@ -65,6 +65,13 @@ class MftH264EncoderImpl : public VideoEncoder {
   bool mf_started_ = false;
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
+
+  // Cached SPS+PPS byte-stream captured from MF_MT_MPEG2_SEQUENCE_HEADER on
+  // the first MF_E_TRANSFORM_STREAM_CHANGE event. Prepended to every IDR
+  // frame whose bitstream doesn't already carry parameter sets inline, so
+  // receivers can actually initialize their H264 decoders (without this,
+  // the entire stream is undecodable and shows as a black frame).
+  std::vector<uint8_t> sequence_header_;
 };
 
 }  // namespace webrtc
