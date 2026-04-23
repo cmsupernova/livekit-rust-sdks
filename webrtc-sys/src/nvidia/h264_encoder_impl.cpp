@@ -425,7 +425,13 @@ int32_t NvidiaH264EncoderImpl::ProcessEncodedFrame(
   encoded_image_.ntp_time_ms_ = inputFrame.ntp_time_ms();
   encoded_image_.capture_time_ms_ = inputFrame.render_time_ms();
   encoded_image_.rotation_ = inputFrame.rotation();
-  encoded_image_.content_type_ = VideoContentType::SCREENSHARE;
+  // Tag RTP content type from the codec_ mode the caller configured us with.
+  // Hardcoding SCREENSHARE here mislabels camera streams, which feeds
+  // wrong signals into SFU bandwidth estimation, any network path that
+  // inspects content-type hints, and downstream recording / analytics.
+  encoded_image_.content_type_ = (codec_.mode == VideoCodecMode::kScreensharing)
+                                     ? VideoContentType::SCREENSHARE
+                                     : VideoContentType::UNSPECIFIED;
   encoded_image_.timing_.flags = VideoSendTiming::kInvalid;
   encoded_image_._frameType = VideoFrameType::kVideoFrameDelta;
   encoded_image_.SetColorSpace(inputFrame.color_space());

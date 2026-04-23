@@ -471,7 +471,13 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
     encoded_image_.ntp_time_ms_ = input_frame.ntp_time_ms();
     encoded_image_.capture_time_ms_ = input_frame.render_time_ms();
     encoded_image_.rotation_ = input_frame.rotation();
-    encoded_image_.content_type_ = VideoContentType::UNSPECIFIED;
+    // Tag RTP content type from codec_.mode. Leaving this permanently
+    // UNSPECIFIED told the SFU that screenshare streams were generic
+    // video, which breaks screenshare-aware bandwidth estimation and
+    // any downstream tooling that filters on content type.
+    encoded_image_.content_type_ = (codec_.mode == VideoCodecMode::kScreensharing)
+                                       ? VideoContentType::SCREENSHARE
+                                       : VideoContentType::UNSPECIFIED;
     encoded_image_.timing_.flags = VideoSendTiming::kInvalid;
     encoded_image_._frameType = VideoFrameType::kVideoFrameDelta;
     encoded_image_.SetColorSpace(input_frame.color_space());
