@@ -236,13 +236,17 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   // regions where the extra bits would be wasted. ~0% perf cost on Turing+
   // NVENC, visible quality improvement (≈5-10% QP reduction in detail areas).
   // Strength 8/15 is NVIDIA's recommended balance for mixed content.
+  //
+  // Temporal AQ is intentionally NOT enabled here: it requires
+  // `numRefFrames >= 2` and `enablePTD = 1`, neither of which is configured
+  // on this realtime path, and it is explicitly unsupported with
+  // `NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY`. On some driver versions the
+  // encoder accepts init with `enableTemporalAQ = 1` anyway and then hard-
+  // crashes (no stack trace, the host process just disappears) on the first
+  // encode call. Leave it off until we have a full CAPS-query + ref-buffer
+  // reconfig path.
   nv_encode_config_.rcParams.enableAQ = 1;
   nv_encode_config_.rcParams.aqStrength = 8;
-  // Temporal AQ: per-block QP adjustment based on temporal complexity —
-  // preserves detail in slow-motion regions, saves bits in fast-motion
-  // regions where detail is lost anyway. Pairs with spatial AQ. Costs one
-  // frame of extra reference-buffer history, which ULTRA_LOW_LATENCY tolerates.
-  nv_encode_config_.rcParams.enableTemporalAQ = 1;
 
   // --- Keyframe interval (screenshare) --------------------------------------
   // WebRTC's default is infinite GOP + PLI-on-request — bitrate-efficient
