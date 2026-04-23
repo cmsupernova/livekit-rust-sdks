@@ -217,7 +217,7 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
 
   nv_encode_config_.profileGUID = nv_profile_guid_;
   nv_encode_config_.gopLength = NVENC_INFINITE_GOPLENGTH;
-  nv_encode_config_.frameIntervalP = 1;
+  nv_encode_config_.frameIntervalP = 1;  // no B-frames (realtime)
   nv_encode_config_.encodeCodecConfig.h264Config.level = nv_enc_level_;
   nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod =
       NVENC_INFINITE_GOPLENGTH;
@@ -229,6 +229,37 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   nv_encode_config_.rcParams.vbvBufferSize = configuration_.target_bps;
   nv_encode_config_.rcParams.vbvInitialDelay =
       nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
+
+  // --- Adaptive quantisation -------------------------------------------------
+  // Spatial AQ: per-macroblock QP adjustment based on spatial complexity —
+  // more bits for flat/detailed regions (skin, text, UI), fewer for noisy
+  // regions where the extra bits would be wasted. ~0% perf cost on Turing+
+  // NVENC, visible quality improvement (≈5-10% QP reduction in detail areas).
+  // Strength 8/15 is NVIDIA's recommended balance for mixed content.
+  nv_encode_config_.rcParams.enableAQ = 1;
+  nv_encode_config_.rcParams.aqStrength = 8;
+  // Temporal AQ: per-block QP adjustment based on temporal complexity —
+  // preserves detail in slow-motion regions, saves bits in fast-motion
+  // regions where detail is lost anyway. Pairs with spatial AQ. Costs one
+  // frame of extra reference-buffer history, which ULTRA_LOW_LATENCY tolerates.
+  nv_encode_config_.rcParams.enableTemporalAQ = 1;
+
+  // --- Keyframe interval (screenshare) --------------------------------------
+  // WebRTC's default is infinite GOP + PLI-on-request — bitrate-efficient
+  // but a new subscriber stares at green frames for ~1 RTT while the PLI
+  // round-trips. For screenshare we'd rather "waste" ~5-10% of the bitrate
+  // budget on a periodic IDR (once per second at target framerate) so that:
+  //   * new viewers see the screen within ≤1 second of joining
+  //   * packet-loss recovery doesn't need a PLI round-trip
+  //   * scrub/seek in saved recordings lands on a keyframe quickly
+  // Realtime camera streams keep infinite GOP (no perceptual upside to
+  // periodic IDRs there; the bitrate saving matters more).
+  if (codec_.mode == VideoCodecMode::kScreensharing) {
+    const uint32_t idr_period =
+        std::max<uint32_t>(1u, configuration_.max_frame_rate);
+    nv_encode_config_.gopLength = idr_period;
+    nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod = idr_period;
+  }
 
   try {
     encoder_->CreateEncoder(&nv_initialize_params_);

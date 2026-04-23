@@ -139,6 +139,37 @@ bool MftH264EncoderImpl::StartStreaming() {
     val.vt = VT_BOOL;
     val.boolVal = VARIANT_TRUE;
     codec_api_->SetValue(&CODECAPI_AVLowLatencyMode, &val);
+
+    // Explicit CBR — AVLowLatencyMode implies CBR on most drivers but
+    // older Intel QSV / AMD MFT variants default to Quality mode and only
+    // respect AVEncCommonMeanBitRate as a hint. Setting the rate control
+    // mode explicitly is defensive and costs nothing when already CBR.
+    VARIANT rc;
+    VariantInit(&rc);
+    rc.vt = VT_UI4;
+    rc.ulVal = eAVEncCommonRateControlMode_CBR;
+    codec_api_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &rc);
+
+    // Force zero B-frames. Base/Constrained Baseline profile already
+    // forbids B-frames, but the CODECAPI is honoured on Main/High and
+    // we pay nothing by setting it on Base, so the safety net holds if
+    // the output profile is ever bumped.
+    VARIANT bp;
+    VariantInit(&bp);
+    bp.vt = VT_UI4;
+    bp.ulVal = 0;
+    codec_api_->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &bp);
+
+    // Screenshare: ~1s GOP for fast new-subscriber startup + recovery.
+    // Realtime camera: leave the MFT default (driver-dependent, but in
+    // low-latency mode it's effectively PLI-driven like webrtc expects).
+    if (codec_.mode == VideoCodecMode::kScreensharing) {
+      VARIANT gop;
+      VariantInit(&gop);
+      gop.vt = VT_UI4;
+      gop.ulVal = std::max<UINT32>(1u, max_framerate_);
+      codec_api_->SetValue(&CODECAPI_AVEncMPVGOPSize, &gop);
+    }
   }
 
   HRESULT hr =
