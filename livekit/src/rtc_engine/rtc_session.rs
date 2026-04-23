@@ -1632,10 +1632,24 @@ impl SessionInner {
 
             transceiver.set_codec_preferences(matched)?;
 
-            if options.source == crate::room::track::TrackSource::Screenshare {
+            // Resolve the degradation preference for this publisher:
+            //   1. Honour whatever the caller put in TrackPublishOptions.
+            //   2. Otherwise keep the legacy screenshare default
+            //      (MaintainResolution — good for slides / detail work).
+            //   3. Otherwise leave unset so libwebrtc picks Balanced.
+            // The explicit override is how consumers publish motion-heavy
+            // screenshares (games, video) with MaintainFramerate.
+            let preferred = options.degradation_preference.or_else(|| {
+                if options.source == crate::room::track::TrackSource::Screenshare {
+                    Some(DegradationPreference::MaintainResolution)
+                } else {
+                    None
+                }
+            });
+            if let Some(pref) = preferred {
                 let sender = transceiver.sender();
                 let mut params = sender.parameters();
-                params.degradation_preference = Some(DegradationPreference::MaintainResolution);
+                params.degradation_preference = Some(pref);
                 let _ = sender.set_parameters(params);
             }
         }

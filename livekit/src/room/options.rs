@@ -88,6 +88,15 @@ pub struct TrackPublishOptions {
     pub source: TrackSource,
     pub stream: String,
     pub preconnect_buffer: bool,
+    /// Optional override for the publisher's degradation preference.
+    ///
+    /// When `None` (default), the engine falls back to the legacy behavior:
+    /// `Screenshare` tracks get `MaintainResolution`, everything else is left
+    /// unset (libwebrtc picks `Balanced`). Set this explicitly to control
+    /// adaptation under CPU / bandwidth pressure — e.g. `MaintainFramerate`
+    /// for `contentHint: 'motion'` (games, video) so the encoder drops
+    /// resolution instead of framerate when things get tight.
+    pub degradation_preference: Option<DegradationPreference>,
 }
 
 impl Default for TrackPublishOptions {
@@ -102,6 +111,7 @@ impl Default for TrackPublishOptions {
             source: TrackSource::Unknown,
             stream: "".to_string(),
             preconnect_buffer: false,
+            degradation_preference: None,
         }
     }
 }
