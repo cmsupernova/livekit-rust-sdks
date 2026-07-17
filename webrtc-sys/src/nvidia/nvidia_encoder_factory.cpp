@@ -21,10 +21,17 @@ NvidiaVideoEncoderFactory::NvidiaVideoEncoderFactory() {
   };
   supported_formats_.push_back(SdpVideoFormat("H264", baselineParameters));
 
+#if !defined(WEBRTC_WIN)
   // Advertise HEVC/H265 with default parameters.
+  // Gated off on Windows: build_windows.cmd builds libwebrtc WITHOUT
+  // rtc_use_h265, so H265 RTP can't be packetized/negotiated there, and "HEVC"
+  // isn't a valid SDP codec name to begin with. Advertising formats that can
+  // never be negotiated just pollutes capability queries. The encoder impl is
+  // left in place for platforms whose libwebrtc does enable H265.
   supported_formats_.push_back(SdpVideoFormat("H265"));
   // Some stacks use 'HEVC' name.
   supported_formats_.push_back(SdpVideoFormat("HEVC"));
+#endif
 
   /*std::map<std::string, std::string> highParameters = {
       {"profile-level-id", "4d0032"},

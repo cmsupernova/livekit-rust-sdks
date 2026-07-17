@@ -15,8 +15,11 @@
 use std::fmt::Debug;
 
 use crate::{
-    imp::rtp_sender as imp_rs, media_stream_track::MediaStreamTrack, rtp_parameters::RtpParameters,
-    stats::RtcStats, RtcError,
+    imp::rtp_sender as imp_rs,
+    media_stream_track::MediaStreamTrack,
+    rtp_parameters::{DegradationPreference, RtpParameters},
+    stats::RtcStats,
+    RtcError,
 };
 
 #[derive(Clone)]
@@ -43,6 +46,17 @@ impl RtpSender {
 
     pub fn set_parameters(&self, parameters: RtpParameters) -> Result<(), RtcError> {
         self.handle.set_parameters(parameters)
+    }
+
+    /// Sets only the sender's degradation preference, mutating the live native
+    /// RtpParameters in place so transaction_id and encodings are preserved.
+    /// The generic `set_parameters` path cannot carry those fields, so it
+    /// always fails for degradation-preference-only changes.
+    pub fn set_degradation_preference(
+        &self,
+        preference: Option<DegradationPreference>,
+    ) -> Result<(), RtcError> {
+        self.handle.set_degradation_preference(preference)
     }
 }
 

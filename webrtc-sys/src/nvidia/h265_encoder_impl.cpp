@@ -136,7 +136,7 @@ int32_t NvidiaH265EncoderImpl::InitEncode(
   nv_initialize_params_.encodeConfig = &nv_encode_config_;
 
   GUID encodeGuid = NV_ENC_CODEC_HEVC_GUID;
-  GUID presetGuid = NV_ENC_PRESET_P4_GUID;
+  GUID presetGuid = NV_ENC_PRESET_P5_GUID;
 
   encoder_->CreateDefaultEncoderParams(&nv_initialize_params_, encodeGuid,
                                        presetGuid,
@@ -150,14 +150,24 @@ int32_t NvidiaH265EncoderImpl::InitEncode(
   nv_encode_config_.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
   nv_encode_config_.gopLength = NVENC_INFINITE_GOPLENGTH;
   nv_encode_config_.frameIntervalP = 1;
+  // Emit VPS/SPS/PPS on every IDR so subscribers that join between forced
+  // keyframes always land on a decodable IDR.
+  nv_encode_config_.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
   nv_encode_config_.rcParams.version = NV_ENC_RC_PARAMS_VER;
   nv_encode_config_.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
   nv_encode_config_.rcParams.averageBitRate = configuration_.target_bps;
+  // NVENC ignores maxBitRate in CBR mode; inert here, kept for VBR parity.
   nv_encode_config_.rcParams.maxBitRate =
       configuration_.target_bps + configuration_.target_bps / 4;
   nv_encode_config_.rcParams.vbvBufferSize = configuration_.target_bps;
   nv_encode_config_.rcParams.vbvInitialDelay =
       nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
+  // Two-pass (quarter-res first pass) tightens low-latency CBR adherence and
+  // reduces per-frame overshoot at negligible cost on NVENC-class GPUs.
+  nv_encode_config_.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+  // Bound IDR size relative to the per-frame P budget to flatten keyframe
+  // spikes. Tuning knob - worth an on-hardware A/B.
+  nv_encode_config_.rcParams.lowDelayKeyFrameScale = 2;
 
   try {
     encoder_->CreateEncoder(&nv_initialize_params_);
@@ -236,17 +246,25 @@ int32_t NvidiaH265EncoderImpl::Encode(
                         << " to I420 for NV12 encode.";
       return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
     }
-    nv12_stride = w;
-    int y_size = w * h;
+    // NV12 needs an even row stride: MergeUVPlane writes 2*((w+1)/2) bytes per
+    // chroma row, which is w+1 for odd widths. Sizing the buffer at stride w
+    // therefore overran the last row by one byte. Use an even stride for both
+    // the Y and interleaved-UV planes (== w for even widths, so no change on
+    // the common path). EncoderInfo.requested_resolution_alignment = 2 already
+    // asks WebRTC for even dimensions; this keeps the fallback allocation safe
+    // even if an odd-width frame slips through.
+    const int nv12_line = 2 * ((w + 1) / 2);
+    nv12_stride = nv12_line;
     int chroma_h = (h + 1) / 2;
-    int uv_size = w * chroma_h;
+    int y_size = nv12_line * h;
+    int uv_size = nv12_line * chroma_h;
     nv12_tmp.resize(y_size + uv_size);
 
     libyuv::CopyPlane(i420->DataY(), i420->StrideY(),
-                       nv12_tmp.data(), w, w, h);
+                       nv12_tmp.data(), nv12_line, w, h);
     libyuv::MergeUVPlane(i420->DataU(), i420->StrideU(),
                           i420->DataV(), i420->StrideV(),
-                          nv12_tmp.data() + y_size, w,
+                          nv12_tmp.data() + y_size, nv12_line,
                           (w + 1) / 2, chroma_h);
     nv12_src = nv12_tmp.data();
   }
@@ -365,6 +383,10 @@ VideoEncoder::EncoderInfo NvidiaH265EncoderImpl::GetEncoderInfo() const {
   info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
   info.is_hardware_accelerated = true;
   info.supports_simulcast = false;
+  // Ask WebRTC to hand us even width/height. The I420->NV12 conversion (and
+  // NVENC itself) assumes even chroma dimensions; odd widths otherwise overran
+  // the temp NV12 buffer during MergeUVPlane (see Encode()).
+  info.requested_resolution_alignment = 2;
   info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNV12, VideoFrameBuffer::Type::kI420};
   return info;
 }
@@ -389,12 +411,22 @@ void NvidiaH265EncoderImpl::SetRates(
   uint32_t new_target_bps = parameters.bitrate.GetSpatialLayerSum(0);
   uint32_t new_framerate = static_cast<uint32_t>(parameters.framerate_fps);
 
+  // BWE feeds SetRates several times per second, very often with values
+  // identical to the previous call. Each Reconfigure re-primes NVENC's rate
+  // control, so skip it when nothing we hand NVENC actually changed.
+  if (new_target_bps == configuration_.target_bps &&
+      new_framerate == static_cast<uint32_t>(configuration_.max_frame_rate)) {
+    configuration_.SetStreamState(new_target_bps > 0);
+    return;
+  }
+
   codec_.maxFramerate = new_framerate;
   codec_.maxBitrate = new_target_bps;
   configuration_.target_bps = new_target_bps;
   configuration_.max_frame_rate = parameters.framerate_fps;
 
   nv_encode_config_.rcParams.averageBitRate = new_target_bps;
+  // Inert in CBR mode (NVENC ignores maxBitRate); kept for VBR parity.
   nv_encode_config_.rcParams.maxBitRate =
       new_target_bps + new_target_bps / 4;
   nv_encode_config_.rcParams.vbvBufferSize = new_target_bps;

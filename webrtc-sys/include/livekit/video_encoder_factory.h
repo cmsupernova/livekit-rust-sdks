@@ -52,5 +52,10 @@ class VideoEncoderFactory : public webrtc::VideoEncoderFactory {
 
  private:
   std::unique_ptr<InternalFactory> internal_factory_;
+  // Pure-software factory handed to SimulcastEncoderAdapter as its fallback, so
+  // a hardware encoder that fails at runtime (NVENC session exhaustion, driver
+  // reset) degrades to software instead of a dead track. Must outlive every
+  // encoder the adapter creates, hence a member rather than a local.
+  std::unique_ptr<webrtc::VideoEncoderFactory> software_factory_;
 };
 }  // namespace livekit_ffi

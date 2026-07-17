@@ -65,6 +65,9 @@ class RtpSender {
 
   void set_parameters(RtpParameters params) const;
 
+  void set_degradation_preference(bool has_value,
+                                  DegradationPreference value) const;
+
   webrtc::scoped_refptr<webrtc::RtpSenderInterface> rtc_sender() const {
     return sender_;
   }

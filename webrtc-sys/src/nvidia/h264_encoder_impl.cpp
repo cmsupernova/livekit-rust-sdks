@@ -75,6 +75,28 @@ NV_ENC_LEVEL H264LevelToNvEncLevel(webrtc::H264Level level) {
 }
 
 
+// Map the parsed SDP H264 profile onto the matching NVENC profile GUID.
+// NVENC has no dedicated Constrained Baseline GUID, so both Baseline and
+// Constrained Baseline map to NV_ENC_H264_PROFILE_BASELINE_GUID. Anything we
+// don't explicitly recognize falls back to AUTOSELECT so NVENC picks a valid
+// profile itself.
+GUID H264ProfileToNvEncGuid(webrtc::H264Profile profile) {
+  switch (profile) {
+    case H264Profile::kProfileConstrainedBaseline:
+    case H264Profile::kProfileBaseline:
+      return NV_ENC_H264_PROFILE_BASELINE_GUID;
+    case H264Profile::kProfileMain:
+      return NV_ENC_H264_PROFILE_MAIN_GUID;
+    case H264Profile::kProfileConstrainedHigh:
+      return NV_ENC_H264_PROFILE_CONSTRAINED_HIGH_GUID;
+    case H264Profile::kProfileHigh:
+      return NV_ENC_H264_PROFILE_HIGH_GUID;
+    default:
+      return NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
+  }
+}
+
+
 NvidiaH264EncoderImpl::NvidiaH264EncoderImpl(
     const webrtc::Environment& env,
     CUcontext context,
@@ -103,6 +125,11 @@ NvidiaH264EncoderImpl::NvidiaH264EncoderImpl(
     // Convert H264Level to NV_ENC_LEVEL.
     nv_enc_level_ = webrtc::H264LevelToNvEncLevel(level_);
   }
+
+  // Resolve the NVENC profile GUID from the parsed profile. Without this the
+  // member stayed uninitialized and later overwrote the encoder's default
+  // profileGUID with garbage (see InitEncode).
+  nv_profile_guid_ = webrtc::H264ProfileToNvEncGuid(profile_);
 
   RTC_CHECK_NE(cu_memory_type_, CU_MEMORYTYPE_HOST);
 }
@@ -204,7 +231,7 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   nv_initialize_params_.encodeConfig = &nv_encode_config_;
 
   GUID encodeGuid = NV_ENC_CODEC_H264_GUID;
-  GUID presetGuid = NV_ENC_PRESET_P4_GUID;
+  GUID presetGuid = NV_ENC_PRESET_P5_GUID;
 
   encoder_->CreateDefaultEncoderParams(&nv_initialize_params_, encodeGuid,
                                        presetGuid,
@@ -221,14 +248,51 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   nv_encode_config_.encodeCodecConfig.h264Config.level = nv_enc_level_;
   nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod =
       NVENC_INFINITE_GOPLENGTH;
+  // Emit SPS/PPS on every IDR (not just forced ones). Periodic GOP IDRs
+  // otherwise carry no parameter sets, so a subscriber that joins between
+  // forced keyframes lands on an undecodable IDR.
+  nv_encode_config_.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+
+  // --- Colour signalling (VUI) ----------------------------------------------
+  // Our capture pipeline converts BGRA -> YUV in BT.709 limited range (GPU
+  // compute shaders + the CPU dcv-color-primitives fallback), but the NV12/
+  // I420 frames carry no colour metadata. Receivers (Chromium / libwebrtc)
+  // assume BT.709 only for unsignaled HD and BT.601 for SD, so without an
+  // explicit signal the stream is subtly desaturated / hue-shifted (reds and
+  // skin tones most visibly). Write a full VUI colour description so nothing
+  // depends on the receiver guessing. limited range (videoFullRangeFlag = 0),
+  // primaries / transfer / matrix all BT.709. repeatSPSPPS above ensures every
+  // periodic IDR carries the SPS with this VUI, so late joiners get it too.
+  NV_ENC_CONFIG_H264_VUI_PARAMETERS& vui =
+      nv_encode_config_.encodeCodecConfig.h264Config.h264VUIParameters;
+  vui.videoSignalTypePresentFlag = 1;
+  vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+  vui.videoFullRangeFlag = 0;
+  vui.colourDescriptionPresentFlag = 1;
+  vui.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+  vui.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+  vui.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+
   nv_encode_config_.rcParams.version = NV_ENC_RC_PARAMS_VER;
   nv_encode_config_.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
   nv_encode_config_.rcParams.averageBitRate = configuration_.target_bps;
+  // NVENC ignores maxBitRate in CBR mode (averageBitRate is the hard target),
+  // so this assignment is inert here. Kept for parity with the rcParams block
+  // and in case the rate-control mode is ever switched to VBR/capped VBR.
   nv_encode_config_.rcParams.maxBitRate =
       configuration_.target_bps + configuration_.target_bps / 4;
   nv_encode_config_.rcParams.vbvBufferSize = configuration_.target_bps;
   nv_encode_config_.rcParams.vbvInitialDelay =
       nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
+  // Two-pass (quarter-res first pass) is NVIDIA's recommended low-latency CBR
+  // pairing: it tightens rate adherence and reduces per-frame overshoot at
+  // negligible cost on NVENC-class GPUs.
+  nv_encode_config_.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+  // Bound the IDR size relative to the per-frame P budget so periodic GOP
+  // keyframes don't spike the wire rate. Under ULTRA_LOW_LATENCY tuning the
+  // driver default is 1; 2 keeps IDRs sharp enough for screenshare text while
+  // still capping the burst. Tuning knob - worth an on-hardware A/B.
+  nv_encode_config_.rcParams.lowDelayKeyFrameScale = 2;
 
   // --- Adaptive quantisation -------------------------------------------------
   // Spatial AQ: per-macroblock QP adjustment based on spatial complexity —
@@ -342,17 +406,25 @@ int32_t NvidiaH264EncoderImpl::Encode(
                         << " to I420 for NV12 encode.";
       return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
     }
-    nv12_stride = w;
-    int y_size = w * h;
+    // NV12 needs an even row stride: MergeUVPlane writes 2*((w+1)/2) bytes per
+    // chroma row, which is w+1 for odd widths. Sizing the buffer at stride w
+    // therefore overran the last row by one byte. Use an even stride for both
+    // the Y and interleaved-UV planes (== w for even widths, so no change on
+    // the common path). EncoderInfo.requested_resolution_alignment = 2 already
+    // asks WebRTC for even dimensions; this keeps the fallback allocation safe
+    // even if an odd-width frame slips through.
+    const int nv12_line = 2 * ((w + 1) / 2);
+    nv12_stride = nv12_line;
     int chroma_h = (h + 1) / 2;
-    int uv_size = w * chroma_h;
+    int y_size = nv12_line * h;
+    int uv_size = nv12_line * chroma_h;
     nv12_tmp.resize(y_size + uv_size);
 
     libyuv::CopyPlane(i420->DataY(), i420->StrideY(),
-                       nv12_tmp.data(), w, w, h);
+                       nv12_tmp.data(), nv12_line, w, h);
     libyuv::MergeUVPlane(i420->DataU(), i420->StrideU(),
                           i420->DataV(), i420->StrideV(),
-                          nv12_tmp.data() + y_size, w,
+                          nv12_tmp.data() + y_size, nv12_line,
                           (w + 1) / 2, chroma_h);
     nv12_src = nv12_tmp.data();
   }
@@ -479,6 +551,10 @@ VideoEncoder::EncoderInfo NvidiaH264EncoderImpl::GetEncoderInfo() const {
   info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
   info.is_hardware_accelerated = true;
   info.supports_simulcast = false;
+  // Ask WebRTC to hand us even width/height. The I420->NV12 conversion (and
+  // NVENC itself) assumes even chroma dimensions; odd widths otherwise overran
+  // the temp NV12 buffer during MergeUVPlane (see Encode()).
+  info.requested_resolution_alignment = 2;
   info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNV12, VideoFrameBuffer::Type::kI420};
   return info;
 }
@@ -503,19 +579,40 @@ void NvidiaH264EncoderImpl::SetRates(
   uint32_t new_target_bps = parameters.bitrate.GetSpatialLayerSum(0);
   uint32_t new_framerate = static_cast<uint32_t>(parameters.framerate_fps);
 
+  // BWE feeds SetRates several times per second, very often with values
+  // identical to the previous call. Each Reconfigure re-primes NVENC's rate
+  // control and can visibly hitch the stream, so skip it when nothing we hand
+  // NVENC actually changed.
+  if (new_target_bps == configuration_.target_bps &&
+      new_framerate == static_cast<uint32_t>(configuration_.max_frame_rate)) {
+    configuration_.SetStreamState(new_target_bps > 0);
+    return;
+  }
+
   codec_.maxFramerate = new_framerate;
   codec_.maxBitrate = new_target_bps;
   configuration_.target_bps = new_target_bps;
   configuration_.max_frame_rate = parameters.framerate_fps;
 
   nv_encode_config_.rcParams.averageBitRate = new_target_bps;
+  // Inert in CBR mode (NVENC ignores maxBitRate); kept for VBR parity.
   nv_encode_config_.rcParams.maxBitRate =
-      new_target_bps + new_target_bps / 4;  // 125% headroom for transients
+      new_target_bps + new_target_bps / 4;
   nv_encode_config_.rcParams.vbvBufferSize = new_target_bps;  // 1 second of buffering
   nv_encode_config_.rcParams.vbvInitialDelay =
       nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
   nv_initialize_params_.frameRateNum = new_framerate;
   nv_initialize_params_.frameRateDen = 1;
+
+  // Recompute the periodic-IDR cadence from the CURRENT framerate. gopLength
+  // is frame-based, so a GOP sized at the initial fps drifts to many seconds
+  // once the framerate drops (a 60-frame GOP is ~9s at 6.7fps idle). Only the
+  // screenshare path uses a finite GOP; camera streams keep infinite GOP.
+  if (codec_.mode == VideoCodecMode::kScreensharing) {
+    const uint32_t idr_period = std::max<uint32_t>(1u, new_framerate);
+    nv_encode_config_.gopLength = idr_period;
+    nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod = idr_period;
+  }
 
   NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {};
   reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;

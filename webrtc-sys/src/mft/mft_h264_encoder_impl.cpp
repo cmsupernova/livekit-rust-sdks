@@ -124,6 +124,17 @@ bool MftH264EncoderImpl::ConfigureInputType() {
   MFSetAttributeRatio(in_type.Get(), MF_MT_FRAME_RATE, max_framerate_, 1);
   in_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
 
+  // Describe the NV12 input as BT.709 limited range so the driver's SPS
+  // generation matches the colour space our capture pipeline actually
+  // converts in (BGRA -> YUV in BT.709 limited). Without this the MFT emits an
+  // SD-defaulted / unsignaled VUI and receivers desaturate / hue-shift the
+  // frame. Whether a given MFT propagates these to the output SPS VUI is
+  // driver-dependent; NVENC is the primary path and signals the VUI directly.
+  in_type->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+  in_type->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+  in_type->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+  in_type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+
   hr = transform_->SetInputType(input_stream_id_, in_type.Get(), 0);
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "MFT SetInputType failed: 0x" << std::hex << hr;
@@ -308,7 +319,27 @@ int32_t MftH264EncoderImpl::Encode(
     codec_api_->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &val);
   }
 
-  const DWORD nv12_size = width_ * height_ * 3 / 2;
+  // MFT is configured for one fixed, even NV12 frame size. Reject a malformed
+  // or unaligned frame before conversion rather than guessing a different
+  // stride: MergeUVPlane writes width+1 bytes per chroma row for odd widths,
+  // while the configured MFT media type still describes a width-byte stride.
+  // requested_resolution_alignment = 2 keeps valid WebRTC traffic on the fast
+  // path; this guard makes a contract violation fail closed instead of risking
+  // heap corruption or chroma-row overlap.
+  if (frame_buffer->width() != width_ || frame_buffer->height() != height_ ||
+      (width_ & 1) != 0 || (height_ & 1) != 0) {
+    RTC_LOG(LS_ERROR) << "MFT received invalid NV12 frame dimensions: "
+                      << frame_buffer->width() << "x" << frame_buffer->height()
+                      << " (configured " << width_ << "x" << height_ << ")";
+    return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+  }
+
+  // With the validated even dimensions this is the canonical contiguous NV12
+  // layout: a full-resolution Y plane followed by a half-height interleaved UV
+  // plane, both with width-byte stride.
+  const DWORD luma_size = width_ * height_;
+  const DWORD chroma_size = width_ * (height_ / 2);
+  const DWORD nv12_size = luma_size + chroma_size;
   Microsoft::WRL::ComPtr<IMFMediaBuffer> input_buffer;
   HRESULT hr = MFCreateMemoryBuffer(nv12_size, input_buffer.GetAddressOf());
   if (FAILED(hr))
@@ -330,7 +361,12 @@ int32_t MftH264EncoderImpl::Encode(
     return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
 
   input_sample->AddBuffer(input_buffer.Get());
-  input_sample->SetSampleTime(static_cast<LONGLONG>(input_frame.rtp_timestamp()));
+  // MF sample time is in 100-ns units. rtp_timestamp() is a 90kHz RTP tick
+  // count, not 100-ns, so feeding it here fed QSV/AMF rate control a bogus
+  // timeline. timestamp_us() * 10 converts microseconds to 100-ns units, which
+  // matches the SampleDuration below (10^7 100-ns == 1 second).
+  input_sample->SetSampleTime(
+      static_cast<LONGLONG>(input_frame.timestamp_us()) * 10);
   input_sample->SetSampleDuration(10000000LL / max_framerate_);
 
   hr = transform_->ProcessInput(input_stream_id_, input_sample.Get(), 0);
@@ -546,6 +582,10 @@ VideoEncoder::EncoderInfo MftH264EncoderImpl::GetEncoderInfo() const {
   info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
   info.is_hardware_accelerated = true;
   info.supports_simulcast = false;
+  // Ask WebRTC for even width/height. The I420->NV12 conversion assumes even
+  // chroma dimensions; odd widths otherwise overran the NV12 buffer during
+  // MergeUVPlane (see Encode()).
+  info.requested_resolution_alignment = 2;
   info.preferred_pixel_formats = {VideoFrameBuffer::Type::kI420};
   return info;
 }

@@ -1648,9 +1648,13 @@ impl SessionInner {
             });
             if let Some(pref) = preferred {
                 let sender = transceiver.sender();
-                let mut params = sender.parameters();
-                params.degradation_preference = Some(pref);
-                let _ = sender.set_parameters(params);
+                // Dedicated FFI path: mutates only degradation_preference on the
+                // native parameters, preserving transaction_id/encodings. The
+                // generic set_parameters round-trip drops both and native
+                // SetParameters then rejects with INVALID_MODIFICATION.
+                if let Err(e) = sender.set_degradation_preference(Some(pref)) {
+                    log::warn!("failed to set degradation preference: {:?}", e);
+                }
             }
         }
 

@@ -140,6 +140,9 @@ VideoEncoderFactory::InternalFactory::Create(
 
 VideoEncoderFactory::VideoEncoderFactory() {
   internal_factory_ = std::make_unique<InternalFactory>();
+  // Software-only factory (VP8/VP9/AV1 and, where built, OpenH264) used as the
+  // SimulcastEncoderAdapter fallback below.
+  software_factory_ = std::make_unique<Factory>();
 }
 
 std::vector<webrtc::SdpVideoFormat> VideoEncoderFactory::GetSupportedFormats()
@@ -158,8 +161,11 @@ std::unique_ptr<webrtc::VideoEncoder> VideoEncoderFactory::Create(
     const webrtc::SdpVideoFormat& format) {
   std::unique_ptr<webrtc::VideoEncoder> encoder;
   if (format.IsCodecInList(internal_factory_->GetSupportedFormats())) {
+    // Primary = internal factory (hardware first), fallback = software factory.
+    // Passing nullptr here meant a hardware encoder failing mid-session left a
+    // dead track; the software fallback keeps the stream alive.
     encoder = std::make_unique<webrtc::SimulcastEncoderAdapter>(
-        env, internal_factory_.get(), nullptr, format);
+        env, internal_factory_.get(), software_factory_.get(), format);
   }
 
   return encoder;

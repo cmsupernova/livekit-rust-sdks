@@ -90,4 +90,23 @@ void RtpSender::set_parameters(RtpParameters params) const {
     throw std::runtime_error(serialize_error(to_error(error)));
 }
 
+void RtpSender::set_degradation_preference(bool has_value,
+                                           DegradationPreference value) const {
+  // Read-modify-write the live native parameters so transaction_id and
+  // encodings survive. libwebrtc's SetParameters rejects any RtpParameters
+  // whose transaction_id or encodings don't match the last GetParameters, so
+  // this must stay entirely on the native object and never round-trip through
+  // the lossy FFI RtpParameters struct.
+  webrtc::RtpParameters params = sender_->GetParameters();
+  if (has_value) {
+    params.degradation_preference =
+        static_cast<webrtc::DegradationPreference>(value);
+  } else {
+    params.degradation_preference.reset();
+  }
+  auto error = sender_->SetParameters(params);
+  if (!error.ok())
+    throw std::runtime_error(serialize_error(to_error(error)));
+}
+
 }  // namespace livekit_ffi

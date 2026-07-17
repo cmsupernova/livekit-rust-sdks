@@ -27,6 +27,7 @@ pub mod ffi {
         type MediaType = crate::webrtc::ffi::MediaType;
         type RtpEncodingParameters = crate::rtp_parameters::ffi::RtpEncodingParameters;
         type RtpParameters = crate::rtp_parameters::ffi::RtpParameters;
+        type DegradationPreference = crate::rtp_parameters::ffi::DegradationPreference;
         type MediaStreamTrack = crate::media_stream::ffi::MediaStreamTrack;
     }
 
@@ -50,6 +51,15 @@ pub mod ffi {
         fn init_send_encodings(self: &RtpSender) -> Vec<RtpEncodingParameters>;
         fn get_parameters(self: &RtpSender) -> RtpParameters;
         fn set_parameters(self: &RtpSender, parameters: RtpParameters) -> Result<()>;
+        // Mutates only degradation_preference on the native RtpParameters,
+        // preserving transaction_id and encodings. The generic set_parameters
+        // path loses both (the lossy high-level RtpParameters type drops them),
+        // so native SetParameters always rejected with INVALID_MODIFICATION.
+        fn set_degradation_preference(
+            self: &RtpSender,
+            has_value: bool,
+            value: DegradationPreference,
+        ) -> Result<()>;
 
         fn _shared_rtp_sender() -> SharedPtr<RtpSender>;
     }
