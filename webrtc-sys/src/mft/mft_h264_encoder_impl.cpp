@@ -171,16 +171,6 @@ bool MftH264EncoderImpl::StartStreaming() {
     bp.ulVal = 0;
     codec_api_->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &bp);
 
-    // Screenshare: ~1s GOP for fast new-subscriber startup + recovery.
-    // Realtime camera: leave the MFT default (driver-dependent, but in
-    // low-latency mode it's effectively PLI-driven like webrtc expects).
-    if (codec_.mode == VideoCodecMode::kScreensharing) {
-      VARIANT gop;
-      VariantInit(&gop);
-      gop.vt = VT_UI4;
-      gop.ulVal = std::max<UINT32>(1u, max_framerate_);
-      codec_api_->SetValue(&CODECAPI_AVEncMPVGOPSize, &gop);
-    }
   }
 
   HRESULT hr =
@@ -290,9 +280,16 @@ int32_t MftH264EncoderImpl::Encode(
   if (!callback_)
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
 
-  auto frame_buffer = input_frame.video_frame_buffer()->ToI420();
-  if (!frame_buffer)
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+  auto* frame_buffer = input_frame.video_frame_buffer().get();
+  const NV12BufferInterface* nv12_buffer = nullptr;
+  webrtc::scoped_refptr<I420BufferInterface> i420_buffer;
+  if (frame_buffer->type() == VideoFrameBuffer::Type::kNV12)
+    nv12_buffer = frame_buffer->GetNV12();
+  if (!nv12_buffer) {
+    i420_buffer = frame_buffer->ToI420();
+    if (!i420_buffer)
+      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+  }
 
   bool force_key = key_frame_request_ ||
                    (frame_types && !frame_types->empty() &&
@@ -350,7 +347,14 @@ int32_t MftH264EncoderImpl::Encode(
   if (FAILED(hr))
     return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
 
-  I420ToNV12(frame_buffer.get(), buffer_data, width_);
+  if (nv12_buffer) {
+    libyuv::CopyPlane(nv12_buffer->DataY(), nv12_buffer->StrideY(),
+                      buffer_data, width_, width_, height_);
+    libyuv::CopyPlane(nv12_buffer->DataUV(), nv12_buffer->StrideUV(),
+                      buffer_data + luma_size, width_, width_, height_ / 2);
+  } else {
+    I420ToNV12(i420_buffer.get(), buffer_data, width_);
+  }
 
   input_buffer->Unlock();
   input_buffer->SetCurrentLength(nv12_size);
@@ -586,7 +590,8 @@ VideoEncoder::EncoderInfo MftH264EncoderImpl::GetEncoderInfo() const {
   // chroma dimensions; odd widths otherwise overran the NV12 buffer during
   // MergeUVPlane (see Encode()).
   info.requested_resolution_alignment = 2;
-  info.preferred_pixel_formats = {VideoFrameBuffer::Type::kI420};
+  info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNV12,
+                                  VideoFrameBuffer::Type::kI420};
   return info;
 }
 
@@ -606,8 +611,29 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
     return;
   }
 
-  target_bps_ = parameters.bitrate.GetSpatialLayerSum(0);
-  max_framerate_ = static_cast<uint32_t>(parameters.framerate_fps);
+  const uint32_t new_target_bps = parameters.bitrate.GetSpatialLayerSum(0);
+  const uint32_t new_framerate =
+      static_cast<uint32_t>(parameters.framerate_fps);
+  const uint32_t bitrate_delta =
+      new_target_bps > target_bps_
+          ? new_target_bps - target_bps_
+          : target_bps_ - new_target_bps;
+  const uint32_t bitrate_threshold =
+      std::max<uint32_t>(100000u, target_bps_ / 20u);
+  const bool framerate_changed = new_framerate != max_framerate_;
+
+  // CODECAPI rate changes can flush/re-prime some vendor MFTs. As on the
+  // direct NVENC path, accumulate insignificant BWE noise rather than
+  // injecting a cadence hitch several times per second.
+  if (bitrate_delta < bitrate_threshold && !framerate_changed) {
+    if (!sending_)
+      key_frame_request_ = true;
+    sending_ = true;
+    return;
+  }
+
+  target_bps_ = new_target_bps;
+  max_framerate_ = new_framerate;
 
   if (codec_api_) {
     VARIANT val;

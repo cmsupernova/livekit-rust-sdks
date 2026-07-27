@@ -312,22 +312,11 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   nv_encode_config_.rcParams.enableAQ = 1;
   nv_encode_config_.rcParams.aqStrength = 8;
 
-  // --- Keyframe interval (screenshare) --------------------------------------
-  // WebRTC's default is infinite GOP + PLI-on-request — bitrate-efficient
-  // but a new subscriber stares at green frames for ~1 RTT while the PLI
-  // round-trips. For screenshare we'd rather "waste" ~5-10% of the bitrate
-  // budget on a periodic IDR (once per second at target framerate) so that:
-  //   * new viewers see the screen within ≤1 second of joining
-  //   * packet-loss recovery doesn't need a PLI round-trip
-  //   * scrub/seek in saved recordings lands on a keyframe quickly
-  // Realtime camera streams keep infinite GOP (no perceptual upside to
-  // periodic IDRs there; the bitrate saving matters more).
-  if (codec_.mode == VideoCodecMode::kScreensharing) {
-    const uint32_t idr_period =
-        std::max<uint32_t>(1u, configuration_.max_frame_rate);
-    nv_encode_config_.gopLength = idr_period;
-    nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod = idr_period;
-  }
+  // Keep the GOP infinite and let WebRTC request IDRs through PLI/FIR and
+  // subscription changes. A periodic one-second IDR resets rate control,
+  // creates a visible cadence hitch under GPU load, and spends 5-10% more
+  // bandwidth. repeatSPSPPS above still makes every requested IDR independently
+  // decodable for new subscribers.
 
   try {
     encoder_->CreateEncoder(&nv_initialize_params_);
@@ -579,18 +568,27 @@ void NvidiaH264EncoderImpl::SetRates(
   uint32_t new_target_bps = parameters.bitrate.GetSpatialLayerSum(0);
   uint32_t new_framerate = static_cast<uint32_t>(parameters.framerate_fps);
 
-  // BWE feeds SetRates several times per second, very often with values
-  // identical to the previous call. Each Reconfigure re-primes NVENC's rate
-  // control and can visibly hitch the stream, so skip it when nothing we hand
-  // NVENC actually changed.
-  if (new_target_bps == configuration_.target_bps &&
-      new_framerate == static_cast<uint32_t>(configuration_.max_frame_rate)) {
+  // BWE feeds SetRates several times per second and normally changes by tiny
+  // amounts each time. Every NVENC Reconfigure re-primes rate control and can
+  // visibly hitch the stream. Accumulate small movements and only apply once
+  // the target differs by at least 5% (or 100 kbps); large congestion drops
+  // still take effect immediately.
+  const uint32_t old_target_bps = configuration_.target_bps;
+  const uint32_t bitrate_delta =
+      new_target_bps > old_target_bps
+          ? new_target_bps - old_target_bps
+          : old_target_bps - new_target_bps;
+  const uint32_t bitrate_threshold =
+      std::max<uint32_t>(100000u, old_target_bps / 20u);
+  const bool framerate_changed =
+      new_framerate != static_cast<uint32_t>(configuration_.max_frame_rate);
+  if (bitrate_delta < bitrate_threshold && !framerate_changed) {
     configuration_.SetStreamState(new_target_bps > 0);
     return;
   }
 
   codec_.maxFramerate = new_framerate;
-  codec_.maxBitrate = new_target_bps;
+  codec_.maxBitrate = new_target_bps / 1000;
   configuration_.target_bps = new_target_bps;
   configuration_.max_frame_rate = parameters.framerate_fps;
 
@@ -603,16 +601,6 @@ void NvidiaH264EncoderImpl::SetRates(
       nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
   nv_initialize_params_.frameRateNum = new_framerate;
   nv_initialize_params_.frameRateDen = 1;
-
-  // Recompute the periodic-IDR cadence from the CURRENT framerate. gopLength
-  // is frame-based, so a GOP sized at the initial fps drifts to many seconds
-  // once the framerate drops (a 60-frame GOP is ~9s at 6.7fps idle). Only the
-  // screenshare path uses a finite GOP; camera streams keep infinite GOP.
-  if (codec_.mode == VideoCodecMode::kScreensharing) {
-    const uint32_t idr_period = std::max<uint32_t>(1u, new_framerate);
-    nv_encode_config_.gopLength = idr_period;
-    nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod = idr_period;
-  }
 
   NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {};
   reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
