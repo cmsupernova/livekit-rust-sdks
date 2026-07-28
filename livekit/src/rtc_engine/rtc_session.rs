@@ -471,6 +471,15 @@ impl RtcSession {
             single_pc_mode,
         );
 
+        // Applied before any media flows so the bandwidth estimator starts
+        // from the caller's seed instead of the ~300 kbps libwebrtc default.
+        // Best-effort: a failure here degrades to the default ramp-up.
+        if let Some(bitrate) = options.publisher_bitrate {
+            if let Err(err) = publisher_pc.peer_connection().set_bitrate(bitrate) {
+                log::warn!("failed to apply publisher bitrate settings: {:?}", err);
+            }
+        }
+
         // In single PC mode, subscriber_pc is None
         let mut subscriber_pc = if single_pc_mode {
             None

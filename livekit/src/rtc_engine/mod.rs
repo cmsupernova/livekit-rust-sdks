@@ -83,6 +83,9 @@ pub struct EngineOptions {
     pub join_retries: u32,
     /// Enable single peer connection mode
     pub single_peer_connection: bool,
+    /// Optional call-level bitrate constraints for the publisher peer
+    /// connection; applied on every session so reconnects keep them.
+    pub publisher_bitrate: Option<libwebrtc::peer_connection::BitrateSettings>,
 }
 
 #[derive(Debug)]

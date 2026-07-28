@@ -17,8 +17,8 @@ use futures_util::{Stream, StreamExt};
 use libwebrtc::{
     native::frame_cryptor::EncryptionState,
     prelude::{
-        ContinualGatheringPolicy, IceTransportsType, MediaStream, MediaStreamTrack,
-        RtcConfiguration,
+        BitrateSettings, ContinualGatheringPolicy, IceTransportsType, MediaStream,
+        MediaStreamTrack, RtcConfiguration,
     },
     rtp_transceiver::RtpTransceiver,
     RtcError,
@@ -394,6 +394,13 @@ pub struct RoomOptions {
     pub single_peer_connection: bool,
     /// Timeout for each individual signal connection attempt
     pub connect_timeout: Duration,
+    /// Optional call-level bitrate constraints applied to the publisher peer
+    /// connection (re-applied on every engine session, so it survives full
+    /// reconnects). `start` seeds the bandwidth estimator instead of the
+    /// conservative ~300 kbps libwebrtc default (which otherwise takes tens of
+    /// seconds to ramp a high-bitrate screenshare), `min` floors the
+    /// allocator, `max` caps it.
+    pub publisher_bitrate: Option<BitrateSettings>,
 }
 
 impl Default for RoomOptions {
@@ -416,6 +423,7 @@ impl Default for RoomOptions {
             sdk_options: RoomSdkOptions::default(),
             single_peer_connection: false,
             connect_timeout: SIGNAL_CONNECT_TIMEOUT,
+            publisher_bitrate: None,
         }
     }
 }
@@ -527,6 +535,7 @@ impl Room {
                 signal_options,
                 join_retries: options.join_retries,
                 single_peer_connection: options.single_peer_connection,
+                publisher_bitrate: options.publisher_bitrate,
             },
             Some(e2ee_manager.clone()),
         )

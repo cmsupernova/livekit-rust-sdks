@@ -29,6 +29,18 @@ use crate::{
     MediaType, RtcError,
 };
 
+/// Call-level bitrate constraints applied via `PeerConnection::SetBitrate`.
+/// Seeds/bounds the bandwidth estimator and bitrate allocator for the whole
+/// connection: `start` overrides the conservative default starting estimate
+/// (~300 kbps), `min` floors the allocator, `max` caps it. `None` leaves the
+/// corresponding constraint at its libwebrtc default.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct BitrateSettings {
+    pub min_bitrate_bps: Option<i32>,
+    pub start_bitrate_bps: Option<i32>,
+    pub max_bitrate_bps: Option<i32>,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PeerConnectionState {
     New,
@@ -187,6 +199,10 @@ impl PeerConnection {
 
     pub fn restart_ice(&self) {
         self.handle.restart_ice()
+    }
+
+    pub fn set_bitrate(&self, settings: BitrateSettings) -> Result<(), RtcError> {
+        self.handle.set_bitrate(settings)
     }
 
     pub fn connection_state(&self) -> PeerConnectionState {

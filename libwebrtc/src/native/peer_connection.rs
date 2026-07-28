@@ -363,6 +363,23 @@ impl PeerConnection {
         self.sys_handle.restart_ice();
     }
 
+    pub fn set_bitrate(
+        &self,
+        settings: crate::peer_connection::BitrateSettings,
+    ) -> Result<(), RtcError> {
+        // The bridge uses <= 0 as the "leave unset" sentinel.
+        let res = self.sys_handle.set_bitrate(
+            settings.min_bitrate_bps.unwrap_or(0),
+            settings.start_bitrate_bps.unwrap_or(0),
+            settings.max_bitrate_bps.unwrap_or(0),
+        );
+
+        match res {
+            Ok(()) => Ok(()),
+            Err(e) => unsafe { Err(sys_err::ffi::RtcError::from(e.what()).into()) },
+        }
+    }
+
     pub fn close(&self) {
         self.sys_handle.close();
     }

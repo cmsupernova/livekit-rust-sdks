@@ -57,6 +57,10 @@ class PeerConnection : webrtc::PeerConnectionObserver {
 
   void set_configuration(RtcConfiguration config) const;
 
+  void set_bitrate(int32_t min_bitrate_bps,
+                   int32_t start_bitrate_bps,
+                   int32_t max_bitrate_bps) const;
+
   void create_offer(
       RtcOfferAnswerOptions options,
       rust::Box<PeerContext> ctx,
