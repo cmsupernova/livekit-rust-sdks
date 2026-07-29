@@ -26,6 +26,23 @@
 
 namespace webrtc {
 
+namespace {
+
+uint32_t FrameSizedVbvBuffer(uint32_t bitrate_bps,
+                             uint32_t frame_rate_num,
+                             uint32_t frame_rate_den) {
+  if (frame_rate_num == 0) {
+    return bitrate_bps;
+  }
+  const uint64_t bits_per_frame =
+      (static_cast<uint64_t>(bitrate_bps) * frame_rate_den +
+       frame_rate_num - 1) /
+      frame_rate_num;
+  return static_cast<uint32_t>(std::max<uint64_t>(1, bits_per_frame));
+}
+
+}  // namespace
+
 // Used by histograms. Values of entries should not be changed.
 enum H264EncoderImplEvent {
   kH264EncoderEventInit = 0,
@@ -281,9 +298,15 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   // and in case the rate-control mode is ever switched to VBR/capped VBR.
   nv_encode_config_.rcParams.maxBitRate =
       configuration_.target_bps + configuration_.target_bps / 4;
-  nv_encode_config_.rcParams.vbvBufferSize = configuration_.target_bps;
+  // NVIDIA recommends a very small VBV for interactive game streaming. One
+  // frame keeps complex frames from borrowing against a full second of
+  // bitrate and landing in WebRTC's pacer as a large burst, which otherwise
+  // inflates TWCC delay and can trigger an avoidable BWE backoff.
+  nv_encode_config_.rcParams.vbvBufferSize = FrameSizedVbvBuffer(
+      configuration_.target_bps, nv_initialize_params_.frameRateNum,
+      nv_initialize_params_.frameRateDen);
   nv_encode_config_.rcParams.vbvInitialDelay =
-      nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
+      nv_encode_config_.rcParams.vbvBufferSize;
   // Two-pass (quarter-res first pass) is NVIDIA's recommended low-latency CBR
   // pairing: it tightens rate adherence and reduces per-frame overshoot at
   // negligible cost on NVENC-class GPUs.
@@ -596,11 +619,13 @@ void NvidiaH264EncoderImpl::SetRates(
   // Inert in CBR mode (NVENC ignores maxBitRate); kept for VBR parity.
   nv_encode_config_.rcParams.maxBitRate =
       new_target_bps + new_target_bps / 4;
-  nv_encode_config_.rcParams.vbvBufferSize = new_target_bps;  // 1 second of buffering
-  nv_encode_config_.rcParams.vbvInitialDelay =
-      nv_encode_config_.rcParams.vbvBufferSize * 9 / 10;
   nv_initialize_params_.frameRateNum = new_framerate;
   nv_initialize_params_.frameRateDen = 1;
+  nv_encode_config_.rcParams.vbvBufferSize = FrameSizedVbvBuffer(
+      new_target_bps, nv_initialize_params_.frameRateNum,
+      nv_initialize_params_.frameRateDen);
+  nv_encode_config_.rcParams.vbvInitialDelay =
+      nv_encode_config_.rcParams.vbvBufferSize;
 
   NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {};
   reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
