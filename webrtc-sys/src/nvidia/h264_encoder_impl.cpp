@@ -335,11 +335,25 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   nv_encode_config_.rcParams.enableAQ = 1;
   nv_encode_config_.rcParams.aqStrength = 8;
 
-  // Keep the GOP infinite and let WebRTC request IDRs through PLI/FIR and
-  // subscription changes. A periodic one-second IDR resets rate control,
-  // creates a visible cadence hitch under GPU load, and spends 5-10% more
-  // bandwidth. repeatSPSPPS above still makes every requested IDR independently
-  // decodable for new subscribers.
+  // --- Screenshare loss-recovery bound (2 s GOP) ----------------------------
+  // Field data (two independent viewers logging the same stream) showed that
+  // when an uplink loss burst outruns NACK recovery, the receiver freezes for
+  // libwebrtc's ~3 s no-decodable-frame timeout before it escalates to a
+  // keyframe request. With an infinite GOP that timeout IS the worst case. A
+  // 2-second scheduled IDR caps recovery at min(next IDR, PLI) — mean ~1 s,
+  // worst ~2 s — at half the overhead of the old 1 s cadence, whose real sin
+  // (per-SetRates GOP reconfigure hammering rate control several times a
+  // second) is gone now that SetRates is hysteresis-gated. lowDelayKeyFrameScale
+  // above bounds the IDR burst size. Camera streams keep the infinite GOP:
+  // there is no perceptual upside to periodic IDRs there and the bitrate
+  // saving matters more.
+  if (codec_.mode == VideoCodecMode::kScreensharing) {
+    const uint32_t idr_period =
+        std::max<uint32_t>(1u, static_cast<uint32_t>(
+                                   configuration_.max_frame_rate) * 2);
+    nv_encode_config_.gopLength = idr_period;
+    nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod = idr_period;
+  }
 
   try {
     encoder_->CreateEncoder(&nv_initialize_params_);
@@ -626,6 +640,18 @@ void NvidiaH264EncoderImpl::SetRates(
       nv_initialize_params_.frameRateDen);
   nv_encode_config_.rcParams.vbvInitialDelay =
       nv_encode_config_.rcParams.vbvBufferSize;
+
+  // Keep the screenshare GOP at ~2 seconds of CURRENT framerate. gopLength is
+  // frame-based, so a GOP sized at the initial fps drifts to many seconds of
+  // wall clock once the framerate drops (a 120-frame GOP is ~18 s at the
+  // 6.7 fps idle keep-alive rate), quietly unbounding loss recovery again.
+  // This only runs on hysteresis-approved reconfigures, so it adds no extra
+  // rate-control churn.
+  if (codec_.mode == VideoCodecMode::kScreensharing) {
+    const uint32_t idr_period = std::max<uint32_t>(1u, new_framerate * 2);
+    nv_encode_config_.gopLength = idr_period;
+    nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod = idr_period;
+  }
 
   NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {};
   reconfigure_params.version = NV_ENC_RECONFIGURE_PARAMS_VER;

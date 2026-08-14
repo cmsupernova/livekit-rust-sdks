@@ -171,6 +171,19 @@ bool MftH264EncoderImpl::StartStreaming() {
     bp.ulVal = 0;
     codec_api_->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &bp);
 
+    // Screenshare: ~2 s GOP to bound loss recovery. When a loss burst outruns
+    // NACK, receivers otherwise freeze for libwebrtc's ~3 s no-decodable-frame
+    // timeout before requesting a keyframe (observed identically on two
+    // independent viewers); a scheduled IDR caps that at min(next IDR, PLI).
+    // Matches the NVENC path's cadence. Camera streams keep the MFT default
+    // (effectively PLI-driven, as webrtc expects).
+    if (codec_.mode == VideoCodecMode::kScreensharing) {
+      VARIANT gop;
+      VariantInit(&gop);
+      gop.vt = VT_UI4;
+      gop.ulVal = std::max<UINT32>(1u, max_framerate_ * 2);
+      codec_api_->SetValue(&CODECAPI_AVEncMPVGOPSize, &gop);
+    }
   }
 
   HRESULT hr =
