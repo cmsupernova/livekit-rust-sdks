@@ -92,7 +92,11 @@ impl NativeVideoSource {
         self.sys_handle.clone()
     }
 
-    pub fn capture_frame<T: AsRef<dyn VideoBuffer>>(&self, frame: &VideoFrame<T>) {
+    /// Returns `false` when WebRTC rejected the frame: its own adaptation
+    /// (framerate or resolution) dropped it before the encoder ever saw it.
+    /// Callers use this to tell WebRTC-side drops apart from encoder-side
+    /// ones - without it, a starving stream and an adapting one look the same.
+    pub fn capture_frame<T: AsRef<dyn VideoBuffer>>(&self, frame: &VideoFrame<T>) -> bool {
         let mut inner = self.inner.lock();
         inner.captured_frames += 1;
 
@@ -108,7 +112,7 @@ impl NativeVideoSource {
             builder.pin_mut().set_timestamp_us(frame.timestamp_us);
         }
 
-        self.sys_handle.on_captured_frame(&builder.pin_mut().build());
+        self.sys_handle.on_captured_frame(&builder.pin_mut().build())
     }
 
     pub fn video_resolution(&self) -> VideoResolution {

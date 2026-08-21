@@ -9,6 +9,9 @@
  *
  */
 
+#include <chrono>
+
+#include "livekit/nvenc_timing.h"
 #include "NvEncoder.h"
 
 #if defined(WIN32)
@@ -510,14 +513,26 @@ void NvEncoder::EncodeFrame(std::vector<std::vector<uint8_t>>& vPacket,
 
   int bfrIdx = m_iToSend % m_nEncoderBuffer;
 
+  // Split submit from wait so the stats tick can say which one dominates.
+  const auto t_submit = std::chrono::steady_clock::now();
   MapResources(bfrIdx);
 
   NVENCSTATUS nvStatus = DoEncode(m_vMappedInputBuffers[bfrIdx],
                                   m_vBitstreamOutputBuffer[bfrIdx], pPicParams);
+  const auto t_wait = std::chrono::steady_clock::now();
+  livekit::nvenc_timing().submit_us.fetch_add(
+      std::chrono::duration_cast<std::chrono::microseconds>(t_wait - t_submit)
+          .count(),
+      std::memory_order_relaxed);
 
   if (nvStatus == NV_ENC_SUCCESS || nvStatus == NV_ENC_ERR_NEED_MORE_INPUT) {
     m_iToSend++;
     GetEncodedPacket(m_vBitstreamOutputBuffer, vPacket, true);
+    const auto t_done = std::chrono::steady_clock::now();
+    livekit::nvenc_timing().wait_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(t_done - t_wait)
+            .count(),
+        std::memory_order_relaxed);
   } else {
     NVENC_THROW_ERROR("nvEncEncodePicture API failed", nvStatus);
   }

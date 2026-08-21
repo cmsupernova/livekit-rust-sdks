@@ -1,3 +1,6 @@
+#include <chrono>
+
+#include "livekit/nvenc_timing.h"
 #include "h264_encoder_impl.h"
 
 
@@ -481,6 +484,7 @@ int32_t NvidiaH264EncoderImpl::Encode(
   try {
     const NvEncInputFrame* nv_enc_input_frame = encoder_->GetNextInputFrame();
 
+    const auto t_copy = std::chrono::steady_clock::now();
     if (cu_memory_type_ == CU_MEMORYTYPE_DEVICE) {
       NvEncoderCuda::CopyToDeviceFrame(
           cu_context_, (void*)nv12_src, nv12_stride,
@@ -489,6 +493,12 @@ int32_t NvidiaH264EncoderImpl::Encode(
           CU_MEMORYTYPE_HOST, nv_enc_input_frame->bufferFormat,
           nv_enc_input_frame->chromaOffsets, nv_enc_input_frame->numChromaPlanes);
     }
+    livekit::nvenc_timing().copy_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_copy)
+            .count(),
+        std::memory_order_relaxed);
+    livekit::nvenc_timing().frames.fetch_add(1, std::memory_order_relaxed);
 
     NV_ENC_PIC_PARAMS pic_params = NV_ENC_PIC_PARAMS();
     pic_params.version = NV_ENC_PIC_PARAMS_VER;

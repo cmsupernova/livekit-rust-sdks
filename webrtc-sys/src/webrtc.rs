@@ -16,6 +16,16 @@ use crate::impl_thread_safety;
 
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
+    /// Aggregated NVENC timing, drained on read. All zero when the NVENC
+    /// path is not compiled in or has not encoded anything yet.
+    #[derive(Debug)]
+    pub struct NvencTiming {
+        pub copy_us: u64,
+        pub submit_us: u64,
+        pub wait_us: u64,
+        pub frames: u64,
+    }
+
     #[derive(Debug)]
     #[repr(i32)]
     pub enum MediaType {
@@ -60,6 +70,10 @@ pub mod ffi {
         type LogSink;
 
         fn create_random_uuid() -> String;
+        /// Read and reset the NVENC timing counters. Splits the single
+        /// `encode_ms_per_frame` stat into host->device copy, submit and
+        /// bitstream wait so the dominant cost is identifiable.
+        fn nvenc_timing_take() -> NvencTiming;
         fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
     }
 }

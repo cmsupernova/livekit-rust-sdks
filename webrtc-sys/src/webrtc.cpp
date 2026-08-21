@@ -21,6 +21,7 @@
 #include <iostream>
 #include <memory>
 
+#include "livekit/nvenc_timing.h"
 #include "livekit/audio_track.h"
 #include "livekit/media_stream_track.h"
 #include "livekit/rtp_receiver.h"
@@ -167,6 +168,16 @@ void LogSink::OnLogMessage(const std::string& message,
 std::unique_ptr<LogSink> new_log_sink(
     rust::Fn<void(rust::String, LoggingSeverity)> fnc) {
   return std::make_unique<LogSink>(fnc);
+}
+
+livekit_ffi::NvencTiming nvenc_timing_take() {
+  auto& c = livekit::nvenc_timing();
+  livekit_ffi::NvencTiming out{};
+  out.copy_us = c.copy_us.exchange(0, std::memory_order_relaxed);
+  out.submit_us = c.submit_us.exchange(0, std::memory_order_relaxed);
+  out.wait_us = c.wait_us.exchange(0, std::memory_order_relaxed);
+  out.frames = c.frames.exchange(0, std::memory_order_relaxed);
+  return out;
 }
 
 rust::String create_random_uuid() {

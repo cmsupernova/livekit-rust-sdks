@@ -115,4 +115,7 @@ std::unique_ptr<LogSink> new_log_sink(
 
 rust::String create_random_uuid();
 
+// Drains the aggregated NVENC timing counters (see nvenc_timing.h).
+livekit_ffi::NvencTiming nvenc_timing_take();
+
 }  // namespace livekit_ffi

@@ -74,7 +74,9 @@ pub mod native {
             Self { handle: vs_imp::NativeVideoSource::new(resolution, is_screencast) }
         }
 
-        pub fn capture_frame<T: AsRef<dyn VideoBuffer>>(&self, frame: &VideoFrame<T>) {
+        /// Returns `false` when WebRTC adaptation dropped the frame before
+        /// the encoder saw it. See the native implementation.
+        pub fn capture_frame<T: AsRef<dyn VideoBuffer>>(&self, frame: &VideoFrame<T>) -> bool {
             self.handle.capture_frame(frame)
         }
 
