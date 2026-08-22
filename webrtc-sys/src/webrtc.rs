@@ -23,7 +23,27 @@ pub mod ffi {
         pub copy_us: u64,
         pub submit_us: u64,
         pub wait_us: u64,
+        /// Number of calls that actually returned encoded output. Distinct
+        /// from submitted `frames` when output-delay pipelining is enabled.
+        pub wait_frames: u64,
         pub frames: u64,
+        /// Bitstream-wait distribution over the drained window. Percentiles
+        /// are reported at the containing histogram bucket edge, clamped to
+        /// the true maximum, so they are upper bounds rather than estimates.
+        pub wait_p50_us: u64,
+        pub wait_p95_us: u64,
+        pub wait_max_us: u64,
+        /// Longest stretch with no encoded output at all: the freeze a viewer
+        /// actually sees, which per-frame timings cannot express.
+        pub output_gap_max_us: u64,
+        /// Submit-to-output residency. `latency_frames` is its own counter
+        /// because frames in flight at the drain boundary have no latency yet.
+        pub latency_us: u64,
+        pub latency_max_us: u64,
+        pub latency_frames: u64,
+        /// Extra NVENC output surfaces currently configured, so a measurement
+        /// window records which arm of an A/B produced it.
+        pub output_delay: u64,
     }
 
     #[derive(Debug)]
@@ -74,6 +94,9 @@ pub mod ffi {
         /// `encode_ms_per_frame` stat into host->device copy, submit and
         /// bitstream wait so the dominant cost is identifiable.
         fn nvenc_timing_take() -> NvencTiming;
+        /// Sets `nExtraOutputDelay` for NVENC encoders created from now on.
+        /// Takes effect on the next encoder creation, never mid-stream.
+        fn nvenc_set_output_delay(delay: u32);
         fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
     }
 }

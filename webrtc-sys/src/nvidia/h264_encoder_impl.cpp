@@ -235,8 +235,13 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   // https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new
   try {
     if (cu_memory_type_ == CU_MEMORYTYPE_DEVICE) {
-      encoder_ = std::make_unique<NvEncoderCuda>(cu_context_, codec_.width,
-                                                 codec_.height, nv_format_, 0);
+      // Read once, here, so the delay is fixed for the life of this encoder
+      // and every frame in `pending_frames_` was submitted under the same
+      // configuration.
+      output_delay_ = livekit::nvenc_output_delay().load(std::memory_order_relaxed);
+      pending_frames_.clear();
+      encoder_ = std::make_unique<NvEncoderCuda>(
+          cu_context_, codec_.width, codec_.height, nv_format_, output_delay_);
     } else {
       RTC_DCHECK_NOTREACHED();
     }
@@ -365,6 +370,11 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
+  livekit::nvenc_note_encoder_start(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+
   RTC_LOG(LS_INFO) << "NVIDIA H264 NVENC initialized: "
                    << codec_.width << "x" << codec_.height
                    << " @ " << codec_.maxFramerate << "fps, target_bps="
@@ -386,9 +396,22 @@ int32_t NvidiaH264EncoderImpl::RegisterEncodeCompleteCallback(
 
 int32_t NvidiaH264EncoderImpl::Release() {
   if (encoder_) {
+    // Drain before teardown. With a non-zero output delay the encoder is
+    // still holding frames we submitted; tearing down without an EOS leaves
+    // those output buffers locked on some drivers. The flushed packets are
+    // discarded rather than delivered: Release runs on stop, on resize and on
+    // encoder recreation, and in all three the callback either is gone or is
+    // about to receive a fresh keyframe anyway.
+    try {
+      std::vector<std::vector<uint8_t>> flushed;
+      encoder_->EndEncode(flushed);
+    } catch (const NVENCException& e) {
+      RTC_LOG(LS_WARNING) << "NvEncoder flush on release failed " << e.what();
+    }
     encoder_->DestroyEncoder();
     encoder_ = nullptr;
   }
+  pending_frames_.clear();
   if (cu_scaled_array_) {
     cuArrayDestroy(cu_scaled_array_);
     cu_scaled_array_ = nullptr;
@@ -510,11 +533,45 @@ int32_t NvidiaH264EncoderImpl::Encode(
       configuration_.key_frame_request = false;
     }
 
+    PendingFrame pending;
+    pending.rtp_timestamp = input_frame.rtp_timestamp();
+    pending.ntp_time_ms = input_frame.ntp_time_ms();
+    pending.render_time_ms = input_frame.render_time_ms();
+    pending.rotation = input_frame.rotation();
+    pending.color_space = input_frame.color_space();
+    pending.submit_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    pending_frames_.push_back(pending);
+    // Hard invariant. In steady state this holds exactly `output_delay_`
+    // entries. Metadata cannot be dropped independently: NVENC still owns the
+    // corresponding encoded frame, so popping only this FIFO would attach its
+    // packet to the next frame's RTP timestamp and shift every later frame.
+    // Recreate the encoder instead; Release drains/discards its outstanding
+    // packets and the replacement starts with a keyframe and an empty FIFO.
+    if (pending_frames_.size() > static_cast<size_t>(output_delay_) + 4) {
+      RTC_LOG(LS_ERROR) << "NvEncoder pending metadata invariant violated";
+      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    }
+
     std::vector<std::vector<uint8_t>> bit_stream;
     encoder_->EncodeFrame(bit_stream, &pic_params);
 
+    const int64_t out_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
     for (std::vector<uint8_t>& packet : bit_stream) {
-      int32_t result = ProcessEncodedFrame(packet, input_frame);
+      if (pending_frames_.empty()) {
+        RTC_LOG(LS_WARNING) << "NvEncoder returned more packets than frames";
+        break;
+      }
+      const PendingFrame meta = pending_frames_.front();
+      pending_frames_.pop_front();
+      if (out_us > meta.submit_us) {
+        livekit::nvenc_note_latency(
+            static_cast<uint64_t>(out_us - meta.submit_us));
+      }
+      int32_t result = ProcessEncodedFrame(packet, meta);
       if (result != WEBRTC_VIDEO_CODEC_OK) {
         return result;
       }
@@ -529,14 +586,14 @@ int32_t NvidiaH264EncoderImpl::Encode(
 
 int32_t NvidiaH264EncoderImpl::ProcessEncodedFrame(
     std::vector<uint8_t>& packet,
-    const ::webrtc::VideoFrame& inputFrame) {
+    const PendingFrame& meta) {
   encoded_image_._encodedWidth = encoder_->GetEncodeWidth();
   encoded_image_._encodedHeight = encoder_->GetEncodeHeight();
-  encoded_image_.SetRtpTimestamp(inputFrame.rtp_timestamp());
+  encoded_image_.SetRtpTimestamp(meta.rtp_timestamp);
   encoded_image_.SetSimulcastIndex(0);
-  encoded_image_.ntp_time_ms_ = inputFrame.ntp_time_ms();
-  encoded_image_.capture_time_ms_ = inputFrame.render_time_ms();
-  encoded_image_.rotation_ = inputFrame.rotation();
+  encoded_image_.ntp_time_ms_ = meta.ntp_time_ms;
+  encoded_image_.capture_time_ms_ = meta.render_time_ms;
+  encoded_image_.rotation_ = meta.rotation;
   // Tag RTP content type from the codec_ mode the caller configured us with.
   // Hardcoding SCREENSHARE here mislabels camera streams, which feeds
   // wrong signals into SFU bandwidth estimation, any network path that
@@ -546,7 +603,7 @@ int32_t NvidiaH264EncoderImpl::ProcessEncodedFrame(
                                      : VideoContentType::UNSPECIFIED;
   encoded_image_.timing_.flags = VideoSendTiming::kInvalid;
   encoded_image_._frameType = VideoFrameType::kVideoFrameDelta;
-  encoded_image_.SetColorSpace(inputFrame.color_space());
+  encoded_image_.SetColorSpace(meta.color_space);
   std::vector<H264::NaluIndex> naluIndices =
       H264::FindNaluIndices(MakeArrayView(packet.data(), packet.size()));
   for (uint32_t i = 0; i < naluIndices.size(); i++) {

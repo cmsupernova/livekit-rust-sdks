@@ -60,6 +60,14 @@ pub mod ffi {
             has_value: bool,
             value: DegradationPreference,
         ) -> Result<()>;
+        // Mutates only encodings[..].max_bitrate_bps on the native
+        // RtpParameters, for the same reason as above. A bitrate-only change
+        // does not reset the encoder, so this is safe to call on a live track.
+        fn set_encoding_max_bitrate(
+            self: &RtpSender,
+            has_value: bool,
+            bitrate_bps: i32,
+        ) -> Result<()>;
 
         fn _shared_rtp_sender() -> SharedPtr<RtpSender>;
     }

@@ -118,4 +118,7 @@ rust::String create_random_uuid();
 // Drains the aggregated NVENC timing counters (see nvenc_timing.h).
 livekit_ffi::NvencTiming nvenc_timing_take();
 
+// Sets nExtraOutputDelay for NVENC encoders created from now on.
+void nvenc_set_output_delay(uint32_t delay);
+
 }  // namespace livekit_ffi

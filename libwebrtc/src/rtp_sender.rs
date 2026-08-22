@@ -58,6 +58,15 @@ impl RtpSender {
     ) -> Result<(), RtcError> {
         self.handle.set_degradation_preference(preference)
     }
+
+    /// Sets only the per-encoding bitrate ceiling, mutating the live native
+    /// RtpParameters in place so transaction_id and encodings are preserved.
+    /// `None` clears the ceiling and hands the decision back to the bandwidth
+    /// estimator. A bitrate-only change does not reset the encoder, so this
+    /// can be called repeatedly on a publishing track.
+    pub fn set_encoding_max_bitrate(&self, bitrate_bps: Option<i32>) -> Result<(), RtcError> {
+        self.handle.set_encoding_max_bitrate(bitrate_bps)
+    }
 }
 
 impl Debug for RtpSender {

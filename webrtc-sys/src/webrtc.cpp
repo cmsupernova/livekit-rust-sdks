@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <iostream>
 #include <memory>
 
@@ -176,8 +177,59 @@ livekit_ffi::NvencTiming nvenc_timing_take() {
   out.copy_us = c.copy_us.exchange(0, std::memory_order_relaxed);
   out.submit_us = c.submit_us.exchange(0, std::memory_order_relaxed);
   out.wait_us = c.wait_us.exchange(0, std::memory_order_relaxed);
+  out.wait_frames = c.wait_frames.exchange(0, std::memory_order_relaxed);
   out.frames = c.frames.exchange(0, std::memory_order_relaxed);
+  out.wait_max_us = c.wait_max_us.exchange(0, std::memory_order_relaxed);
+  out.output_gap_max_us =
+      c.output_gap_max_us.exchange(0, std::memory_order_relaxed);
+
+  uint64_t counts[livekit::kNvencWaitBucketCount];
+  uint64_t total = 0;
+  for (uint32_t i = 0; i < livekit::kNvencWaitBucketCount; ++i) {
+    counts[i] = c.wait_hist[i].exchange(0, std::memory_order_relaxed);
+    total += counts[i];
+  }
+  // Bucket edge containing the requested rank. Reported as an upper bound
+  // (never interpolated into a precision the histogram does not have) and
+  // clamped to the observed maximum so a sparse window cannot report a
+  // percentile above anything that actually happened.
+  auto percentile = [&](double p) -> uint64_t {
+    if (total == 0) {
+      return 0;
+    }
+    // Nearest-rank percentile uses ceil(N * p). Flooring materially
+    // under-reports p95 in the small samples produced by a two-second window
+    // (for N=2, floor picked the first observation instead of the second).
+    uint64_t rank = static_cast<uint64_t>(
+        std::ceil(static_cast<double>(total) * p));
+    uint64_t seen = 0;
+    for (uint32_t i = 0; i < livekit::kNvencWaitBucketCount; ++i) {
+      seen += counts[i];
+      if (seen >= rank) {
+        uint64_t edge = livekit::kNvencWaitBucketUpperUs[i];
+        return out.wait_max_us > 0 && edge > out.wait_max_us ? out.wait_max_us
+                                                             : edge;
+      }
+    }
+    return out.wait_max_us;
+  };
+  out.wait_p50_us = percentile(0.50);
+  out.wait_p95_us = percentile(0.95);
+  out.latency_us = c.latency_us.exchange(0, std::memory_order_relaxed);
+  out.latency_max_us = c.latency_max_us.exchange(0, std::memory_order_relaxed);
+  out.latency_frames = c.latency_frames.exchange(0, std::memory_order_relaxed);
+  // Not drained: it describes the configuration this window ran under.
+  out.output_delay = livekit::nvenc_output_delay().load(std::memory_order_relaxed);
   return out;
+}
+
+void nvenc_set_output_delay(uint32_t delay) {
+  // Bounded here rather than trusting the caller. Beyond a couple of frames
+  // the added residency costs a live screen share more than the overlap wins,
+  // and an unbounded value would let one bad call queue seconds of stale
+  // screen history.
+  livekit::nvenc_output_delay().store(delay > 3 ? 3 : delay,
+                                      std::memory_order_relaxed);
 }
 
 rust::String create_random_uuid() {

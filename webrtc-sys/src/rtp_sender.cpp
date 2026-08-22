@@ -109,4 +109,29 @@ void RtpSender::set_degradation_preference(bool has_value,
     throw std::runtime_error(serialize_error(to_error(error)));
 }
 
+void RtpSender::set_encoding_max_bitrate(bool has_value,
+                                         int32_t bitrate_bps) const {
+  // Same read-modify-write discipline as set_degradation_preference above:
+  // native SetParameters rejects any RtpParameters whose transaction_id or
+  // encodings don't match the last GetParameters, so the ceiling is edited on
+  // the live object and never round-tripped through the lossy FFI struct.
+  //
+  // This is deliberately a rate change, not a reconfiguration. libwebrtc's
+  // RequiresEncoderReset() ignores max_bitrate, so the new ceiling reaches the
+  // encoder through SetRates without a re-InitEncode, without dropping the
+  // NVENC session, and without renegotiating the peer connection. Callers use
+  // it to shed bitrate under load on a live share.
+  webrtc::RtpParameters params = sender_->GetParameters();
+  for (auto& encoding : params.encodings) {
+    if (has_value) {
+      encoding.max_bitrate_bps = bitrate_bps;
+    } else {
+      encoding.max_bitrate_bps.reset();
+    }
+  }
+  auto error = sender_->SetParameters(params);
+  if (!error.ok())
+    throw std::runtime_error(serialize_error(to_error(error)));
+}
+
 }  // namespace livekit_ffi

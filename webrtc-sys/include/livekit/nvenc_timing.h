@@ -26,18 +26,119 @@
 // and a torn read costs at most one skewed sample.
 namespace livekit {
 
+// Upper edges, in microseconds, of the bitstream-wait histogram. Means hide
+// exactly the shape that matters here: a 30ms average with a 2.8s maximum and
+// a flat 30ms are the same number and completely different experiences, and
+// only one of them is a viewer watching a frozen screen. Roughly doubling
+// edges, dense around the frame periods that decide whether a rate is
+// sustainable (16ms, 33ms, 66ms).
+inline constexpr uint32_t kNvencWaitBucketCount = 14;
+inline constexpr uint64_t kNvencWaitBucketUpperUs[kNvencWaitBucketCount] = {
+    1000,   2000,   4000,    8000,    16000,   33000,   66000,
+    125000, 250000, 500000,  1000000, 2000000, 4000000, 8000000};
+
 struct NvencTimingCounters {
   std::atomic<uint64_t> copy_us{0};
   std::atomic<uint64_t> submit_us{0};
   std::atomic<uint64_t> wait_us{0};
+  std::atomic<uint64_t> wait_frames{0};
   std::atomic<uint64_t> frames{0};
+  // Distribution of the bitstream wait, drained with the sums.
+  std::atomic<uint64_t> wait_max_us{0};
+  std::atomic<uint64_t> wait_hist[kNvencWaitBucketCount];
+  // Longest stretch the encoder produced NO output at all. This is the number
+  // that corresponds to what a viewer calls a freeze; it is not recoverable
+  // from per-frame timings, because during a stall there are no frames.
+  std::atomic<uint64_t> output_gap_max_us{0};
+  std::atomic<uint64_t> last_output_us{0};
+  // Submit -> bitstream-available, per frame. Distinct from the bitstream
+  // wait: with a non-zero output delay the encoder returns a packet for an
+  // EARLIER frame, so the wait can fall while the latency each frame actually
+  // experiences rises. Pipelining that improves throughput by adding delay is
+  // not a win for a live screen share, and only this number can tell them
+  // apart.
+  std::atomic<uint64_t> latency_us{0};
+  std::atomic<uint64_t> latency_max_us{0};
+  std::atomic<uint64_t> latency_frames{0};
 };
+
+// Extra NVENC output surfaces (`nExtraOutputDelay`). 0 = fully serialized:
+// one input buffer, no overlap between the copy for frame N+1 and the encode
+// of frame N. Higher values let those overlap at the cost of holding frames
+// longer, which is why it is a knob and not a constant: for a live share the
+// tradeoff has to be measured on real hardware, not assumed.
+//
+// Read once when the encoder is created, so a change takes effect on the next
+// share rather than mid-stream.
+inline std::atomic<uint32_t>& nvenc_output_delay() {
+  static std::atomic<uint32_t> delay{0};
+  return delay;
+}
 
 // Defined inline (C++17) so both the encoder impl and the NvEncoder wrapper
 // share one instance without a dedicated translation unit.
 inline NvencTimingCounters& nvenc_timing() {
+  // Static storage duration, so every counter (including the histogram array)
+  // is zero-initialized before any dynamic initialization runs.
   static NvencTimingCounters counters;
   return counters;
+}
+
+// Records one bitstream wait: sum, running maximum, and histogram bucket.
+inline void nvenc_note_wait(uint64_t wait_us) {
+  NvencTimingCounters& c = nvenc_timing();
+  c.wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+  c.wait_frames.fetch_add(1, std::memory_order_relaxed);
+
+  uint64_t prev_max = c.wait_max_us.load(std::memory_order_relaxed);
+  while (wait_us > prev_max &&
+         !c.wait_max_us.compare_exchange_weak(prev_max, wait_us,
+                                              std::memory_order_relaxed)) {
+  }
+
+  uint32_t bucket = kNvencWaitBucketCount - 1;
+  for (uint32_t i = 0; i < kNvencWaitBucketCount; ++i) {
+    if (wait_us < kNvencWaitBucketUpperUs[i]) {
+      bucket = i;
+      break;
+    }
+  }
+  c.wait_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+}
+
+// Starts a new encoder output timeline. Without this reset, the first output
+// of a later share measures all time since the previous share's final output
+// and reports stopped time as an NVENC freeze in the new A/B arm.
+inline void nvenc_note_encoder_start(uint64_t now_us) {
+  nvenc_timing().last_output_us.store(now_us, std::memory_order_relaxed);
+}
+
+// Records how long one frame spent inside the encoder, submit to output.
+inline void nvenc_note_latency(uint64_t latency_us) {
+  NvencTimingCounters& c = nvenc_timing();
+  c.latency_us.fetch_add(latency_us, std::memory_order_relaxed);
+  c.latency_frames.fetch_add(1, std::memory_order_relaxed);
+  uint64_t prev_max = c.latency_max_us.load(std::memory_order_relaxed);
+  while (latency_us > prev_max &&
+         !c.latency_max_us.compare_exchange_weak(prev_max, latency_us,
+                                                 std::memory_order_relaxed)) {
+  }
+}
+
+// Records that encoded output appeared at `now_us` (steady clock), tracking
+// the longest gap between consecutive outputs.
+inline void nvenc_note_output(uint64_t now_us) {
+  NvencTimingCounters& c = nvenc_timing();
+  uint64_t prev = c.last_output_us.exchange(now_us, std::memory_order_relaxed);
+  if (prev == 0 || now_us <= prev) {
+    return;
+  }
+  uint64_t gap = now_us - prev;
+  uint64_t prev_max = c.output_gap_max_us.load(std::memory_order_relaxed);
+  while (gap > prev_max &&
+         !c.output_gap_max_us.compare_exchange_weak(prev_max, gap,
+                                                    std::memory_order_relaxed)) {
+  }
 }
 
 }  // namespace livekit

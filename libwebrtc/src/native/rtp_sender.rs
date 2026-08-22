@@ -94,4 +94,10 @@ impl RtpSender {
             )
             .map_err(|e| unsafe { sys_err::ffi::RtcError::from(e.what()).into() })
     }
+
+    pub fn set_encoding_max_bitrate(&self, bitrate_bps: Option<i32>) -> Result<(), RtcError> {
+        self.sys_handle
+            .set_encoding_max_bitrate(bitrate_bps.is_some(), bitrate_bps.unwrap_or(0))
+            .map_err(|e| unsafe { sys_err::ffi::RtcError::from(e.what()).into() })
+    }
 }

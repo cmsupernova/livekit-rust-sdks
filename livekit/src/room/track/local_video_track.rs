@@ -135,6 +135,25 @@ impl LocalVideoTrack {
         self.inner.events.lock().unmuted.replace(Box::new(f));
     }
 
+    /// Lowers or restores this track's encoder bitrate ceiling on the live
+    /// sender. Unlike republishing with new `TrackPublishOptions`, this keeps
+    /// the NVENC session, the SSRC and the negotiated SDP intact: libwebrtc
+    /// routes a bitrate-only change through `SetRates`. `None` restores
+    /// estimator control.
+    ///
+    /// Returns `InvalidState` if the track is not currently published.
+    pub fn set_max_bitrate(&self, bitrate_bps: Option<u32>) -> Result<(), RtcError> {
+        let Some(transceiver) = self.transceiver() else {
+            return Err(RtcError {
+                error_type: RtcErrorType::InvalidState,
+                message: "track is not published".to_owned(),
+            });
+        };
+        transceiver
+            .sender()
+            .set_encoding_max_bitrate(bitrate_bps.map(|bps| bps.min(i32::MAX as u32) as i32))
+    }
+
     pub(crate) fn transceiver(&self) -> Option<RtpTransceiver> {
         self.inner.info.read().transceiver.clone()
     }

@@ -68,6 +68,8 @@ class RtpSender {
   void set_degradation_preference(bool has_value,
                                   DegradationPreference value) const;
 
+  void set_encoding_max_bitrate(bool has_value, int32_t bitrate_bps) const;
+
   webrtc::scoped_refptr<webrtc::RtpSenderInterface> rtc_sender() const {
     return sender_;
   }

@@ -529,10 +529,18 @@ void NvEncoder::EncodeFrame(std::vector<std::vector<uint8_t>>& vPacket,
     m_iToSend++;
     GetEncodedPacket(m_vBitstreamOutputBuffer, vPacket, true);
     const auto t_done = std::chrono::steady_clock::now();
-    livekit::nvenc_timing().wait_us.fetch_add(
-        std::chrono::duration_cast<std::chrono::microseconds>(t_done - t_wait)
-            .count(),
-        std::memory_order_relaxed);
+    // Only when a packet actually came back. With a non-zero output delay the
+    // first calls return nothing and complete instantly; counting those as
+    // fast waits would flatter every percentile in the histogram.
+    if (!vPacket.empty()) {
+      livekit::nvenc_note_wait(
+          std::chrono::duration_cast<std::chrono::microseconds>(t_done - t_wait)
+              .count());
+      livekit::nvenc_note_output(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              t_done.time_since_epoch())
+              .count());
+    }
   } else {
     NVENC_THROW_ERROR("nvEncEncodePicture API failed", nvStatus);
   }

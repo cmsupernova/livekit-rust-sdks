@@ -3,7 +3,9 @@
 
 #include <cuda.h>
 
+#include <deque>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "NvEncoder/NvEncoder.h"
@@ -64,13 +66,35 @@ class NvidiaH264EncoderImpl : public VideoEncoder {
   EncoderInfo GetEncoderInfo() const override;
 
  private:
+  // Metadata of a frame handed to NVENC but not yet returned as a bitstream.
+  //
+  // With `nExtraOutputDelay > 0` the encoder buffers frames internally, so the
+  // packet EncodeFrame hands back belongs to an EARLIER VideoFrame than the
+  // one just submitted. Attaching the current frame timestamps to it would
+  // corrupt RTP timing, A/V sync and every receiver-side delay estimate, and
+  // would do so silently: the stream keeps playing, just wrong. Only the
+  // fields the encoded image needs are kept, so a queued frame does not also
+  // pin its pixel buffer out of libwebrtc's pool.
+  struct PendingFrame {
+    uint32_t rtp_timestamp = 0;
+    int64_t ntp_time_ms = 0;
+    int64_t render_time_ms = 0;
+    ::webrtc::VideoRotation rotation = ::webrtc::kVideoRotation_0;
+    std::optional<::webrtc::ColorSpace> color_space;
+    int64_t submit_us = 0;
+  };
+
   int32_t ProcessEncodedFrame(std::vector<uint8_t>& packet,
-                              const ::webrtc::VideoFrame& inputFrame);
+                              const PendingFrame& meta);
  private:
   const webrtc::Environment& env_;
   EncodedImageCallback* encoded_image_callback_ = nullptr;
 
   std::unique_ptr<NvEncoder> encoder_;
+  // Strictly ordered, strictly bounded: one entry per submitted frame, popped
+  // in the same order NVENC returns bitstreams.
+  std::deque<PendingFrame> pending_frames_;
+  uint32_t output_delay_ = 0;
   CUcontext cu_context_;
   CUmemorytype cu_memory_type_;
   CUarray cu_scaled_array_;
