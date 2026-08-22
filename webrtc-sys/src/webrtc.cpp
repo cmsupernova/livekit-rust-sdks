@@ -223,6 +223,14 @@ livekit_ffi::NvencTiming nvenc_timing_take() {
   return out;
 }
 
+void nvenc_set_screen_profile(uint32_t profile) {
+  // Unknown ids fall back to the shipped default rather than to whatever the
+  // last share happened to set: a stale process-global is the one way this
+  // could silently mislabel a measurement window.
+  livekit::nvenc_screen_profile().store(profile > 2 ? 0 : profile,
+                                        std::memory_order_relaxed);
+}
+
 void nvenc_set_output_delay(uint32_t delay) {
   // Bounded here rather than trusting the caller. Beyond a couple of frames
   // the added residency costs a live screen share more than the overlap wins,

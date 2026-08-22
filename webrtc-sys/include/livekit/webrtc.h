@@ -121,4 +121,7 @@ livekit_ffi::NvencTiming nvenc_timing_take();
 // Sets nExtraOutputDelay for NVENC encoders created from now on.
 void nvenc_set_output_delay(uint32_t delay);
 
+// Selects the NVENC effort profile for encoders created from now on.
+void nvenc_set_screen_profile(uint32_t profile);
+
 }  // namespace livekit_ffi

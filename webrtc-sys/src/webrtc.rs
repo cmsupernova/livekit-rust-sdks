@@ -97,6 +97,10 @@ pub mod ffi {
         /// Sets `nExtraOutputDelay` for NVENC encoders created from now on.
         /// Takes effect on the next encoder creation, never mid-stream.
         fn nvenc_set_output_delay(delay: u32);
+        /// Selects the NVENC effort profile (0 quality, 1 single-pass, 2 fast)
+        /// for encoders created from now on. Takes effect on the next encoder
+        /// creation, never mid-stream.
+        fn nvenc_set_screen_profile(profile: u32);
         fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
     }
 }

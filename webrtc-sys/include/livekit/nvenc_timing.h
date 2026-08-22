@@ -32,10 +32,17 @@ namespace livekit {
 // only one of them is a viewer watching a frozen screen. Roughly doubling
 // edges, dense around the frame periods that decide whether a rate is
 // sustainable (16ms, 33ms, 66ms).
-inline constexpr uint32_t kNvencWaitBucketCount = 14;
+// Dense between 12ms and 66ms on purpose. That band holds every frame budget
+// the pacing ladder can ask for (16.7ms at 60fps through 66.7ms at 15fps), so
+// it is where a percentile has to be sharp to answer whether a configuration
+// change actually bought back the budget. A coarser ladder here reported a
+// 21ms mean wait as a p50 of "33" simply because 16-33 was one bucket, which
+// is a true upper bound and a useless one.
+inline constexpr uint32_t kNvencWaitBucketCount = 20;
 inline constexpr uint64_t kNvencWaitBucketUpperUs[kNvencWaitBucketCount] = {
-    1000,   2000,   4000,    8000,    16000,   33000,   66000,
-    125000, 250000, 500000,  1000000, 2000000, 4000000, 8000000};
+    1000,   2000,   4000,   8000,    12000,   16000,   20000,
+    25000,  33000,  40000,  50000,   66000,   100000,  125000,
+    250000, 500000, 1000000, 2000000, 4000000, 8000000};
 
 struct NvencTimingCounters {
   std::atomic<uint64_t> copy_us{0};
@@ -70,6 +77,27 @@ struct NvencTimingCounters {
 //
 // Read once when the encoder is created, so a change takes effect on the next
 // share rather than mid-stream.
+// Encoder effort profile for screen shares, selected per publish so two arms
+// can be compared on the same machine and the same game.
+//
+//   0  quality      P5 + quarter-resolution two-pass  (the shipped default)
+//   1  single-pass  P5, multipass disabled
+//   2  fast         P3, multipass disabled
+//
+// The field measurement this exists to settle: NVENC bitstream waits of 20-25ms
+// against a 16.7ms budget at 2560x1350, while QP sat at 14-28. That much QP
+// headroom means the encoder was buying quality nobody needed at a frame rate
+// the streamer could feel. Both arms trade analysis effort, which is the only
+// encoder cost large enough to matter here - the copy is 0.5ms and the submit
+// is 0.3ms.
+//
+// Read once when the encoder is created, so preset and multipass always agree
+// and every frame in a measurement window ran under one configuration.
+inline std::atomic<uint32_t>& nvenc_screen_profile() {
+  static std::atomic<uint32_t> profile{0};
+  return profile;
+}
+
 inline std::atomic<uint32_t>& nvenc_output_delay() {
   static std::atomic<uint32_t> delay{0};
   return delay;

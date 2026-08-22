@@ -255,8 +255,18 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   nv_encode_config_.version = NV_ENC_CONFIG_VER;
   nv_initialize_params_.encodeConfig = &nv_encode_config_;
 
+  // Read once, here, so the preset chosen below and the multipass setting
+  // applied further down cannot disagree, and so a profile switch mid-session
+  // cannot split one measurement window across two configurations.
+  const uint32_t screen_profile =
+      livekit::nvenc_screen_profile().load(std::memory_order_relaxed);
+
   GUID encodeGuid = NV_ENC_CODEC_H264_GUID;
-  GUID presetGuid = NV_ENC_PRESET_P5_GUID;
+  // P3 drops motion-search effort relative to P5. Under ULTRA_LOW_LATENCY
+  // tuning there is no lookahead and there are no B-frames to give up, so the
+  // preset is very nearly a pure search-effort dial here.
+  GUID presetGuid =
+      screen_profile == 2 ? NV_ENC_PRESET_P3_GUID : NV_ENC_PRESET_P5_GUID;
 
   encoder_->CreateDefaultEncoderParams(&nv_initialize_params_, encodeGuid,
                                        presetGuid,
@@ -318,7 +328,15 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   // Two-pass (quarter-res first pass) is NVIDIA's recommended low-latency CBR
   // pairing: it tightens rate adherence and reduces per-frame overshoot at
   // negligible cost on NVENC-class GPUs.
-  nv_encode_config_.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+  //
+  // "Negligible cost on NVENC-class GPUs" holds on an idle GPU. It is exactly
+  // what stops holding when a game is saturating the same GPU, which is the
+  // case this profile exists to measure: the quarter-resolution first pass is
+  // real additional analysis work per frame, and the field data showed plenty
+  // of QP headroom to give back instead.
+  nv_encode_config_.rcParams.multiPass = screen_profile == 0
+                                             ? NV_ENC_TWO_PASS_QUARTER_RESOLUTION
+                                             : NV_ENC_MULTI_PASS_DISABLED;
   // Bound the IDR size relative to the per-frame P budget so periodic GOP
   // keyframes don't spike the wire rate. Under ULTRA_LOW_LATENCY tuning the
   // driver default is 1; 2 keeps IDRs sharp enough for screenshare text while
