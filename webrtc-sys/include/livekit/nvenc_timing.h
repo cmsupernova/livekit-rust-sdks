@@ -67,6 +67,16 @@ struct NvencTimingCounters {
   std::atomic<uint64_t> latency_us{0};
   std::atomic<uint64_t> latency_max_us{0};
   std::atomic<uint64_t> latency_frames{0};
+  // Actual encoded picture type, classified after the H.264 bitstream is
+  // returned. This includes periodic GOP IDRs (which are not marked in the
+  // input pic params), so it can answer whether the 2 s keyframe cadence is
+  // responsible for the observed wait spikes.
+  std::atomic<uint64_t> key_wait_us{0};
+  std::atomic<uint64_t> key_wait_max_us{0};
+  std::atomic<uint64_t> key_wait_frames{0};
+  std::atomic<uint64_t> delta_wait_us{0};
+  std::atomic<uint64_t> delta_wait_max_us{0};
+  std::atomic<uint64_t> delta_wait_frames{0};
 };
 
 // Extra NVENC output surfaces (`nExtraOutputDelay`). 0 = fully serialized:
@@ -80,9 +90,10 @@ struct NvencTimingCounters {
 // Encoder effort profile for screen shares, selected per publish so two arms
 // can be compared on the same machine and the same game.
 //
-//   0  quality      P5 + quarter-resolution two-pass  (the shipped default)
+//   0  quality      P5 + quarter-resolution two-pass  (legacy baseline)
 //   1  single-pass  P5, multipass disabled
-//   2  fast         P3, multipass disabled
+//   2  fast         P3, multipass disabled (production default)
+//   3  fast-gop10   P3, multipass disabled, 10 s periodic GOP
 //
 // The field measurement this exists to settle: NVENC bitstream waits of 20-25ms
 // against a 16.7ms budget at 2560x1350, while QP sat at 14-28. That much QP
@@ -94,8 +105,17 @@ struct NvencTimingCounters {
 // Read once when the encoder is created, so preset and multipass always agree
 // and every frame in a measurement window ran under one configuration.
 inline std::atomic<uint32_t>& nvenc_screen_profile() {
-  static std::atomic<uint32_t> profile{0};
+  static std::atomic<uint32_t> profile{2};
   return profile;
+}
+
+// Staff isolation selector read when a native video encoder is created.
+// 0 keeps the normal factory order, while 1/2/3 force the existing NVIDIA,
+// MFT, or software H.264 path. It is intentionally process-global: Rift has
+// one native screen publisher and camera remains in WebView2 today.
+inline std::atomic<uint32_t>& screen_encoder_mode() {
+  static std::atomic<uint32_t> mode{0};
+  return mode;
 }
 
 inline std::atomic<uint32_t>& nvenc_output_delay() {
@@ -150,6 +170,23 @@ inline void nvenc_note_latency(uint64_t latency_us) {
   while (latency_us > prev_max &&
          !c.latency_max_us.compare_exchange_weak(prev_max, latency_us,
                                                  std::memory_order_relaxed)) {
+  }
+}
+
+inline void nvenc_note_frame_type_wait(uint64_t wait_us, bool keyframe) {
+  if (wait_us == 0) {
+    return;
+  }
+  NvencTimingCounters& c = nvenc_timing();
+  auto& sum = keyframe ? c.key_wait_us : c.delta_wait_us;
+  auto& maximum = keyframe ? c.key_wait_max_us : c.delta_wait_max_us;
+  auto& frames = keyframe ? c.key_wait_frames : c.delta_wait_frames;
+  sum.fetch_add(wait_us, std::memory_order_relaxed);
+  frames.fetch_add(1, std::memory_order_relaxed);
+  uint64_t previous = maximum.load(std::memory_order_relaxed);
+  while (wait_us > previous &&
+         !maximum.compare_exchange_weak(previous, wait_us,
+                                        std::memory_order_relaxed)) {
   }
 }
 

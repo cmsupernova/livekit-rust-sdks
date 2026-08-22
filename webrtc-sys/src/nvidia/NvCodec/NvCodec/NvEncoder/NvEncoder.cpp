@@ -507,6 +507,7 @@ void NvEncoder::MapResources(uint32_t bfrIdx) {
 void NvEncoder::EncodeFrame(std::vector<std::vector<uint8_t>>& vPacket,
                             NV_ENC_PIC_PARAMS* pPicParams) {
   vPacket.clear();
+  m_lastBitstreamWaitUs = 0;
   if (!IsHWEncoderInitialized()) {
     NVENC_THROW_ERROR("Encoder device not found", NV_ENC_ERR_NO_ENCODE_DEVICE);
   }
@@ -533,9 +534,10 @@ void NvEncoder::EncodeFrame(std::vector<std::vector<uint8_t>>& vPacket,
     // first calls return nothing and complete instantly; counting those as
     // fast waits would flatter every percentile in the histogram.
     if (!vPacket.empty()) {
-      livekit::nvenc_note_wait(
+      m_lastBitstreamWaitUs = static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(t_done - t_wait)
               .count());
+      livekit::nvenc_note_wait(m_lastBitstreamWaitUs);
       livekit::nvenc_note_output(
           std::chrono::duration_cast<std::chrono::microseconds>(
               t_done.time_since_epoch())

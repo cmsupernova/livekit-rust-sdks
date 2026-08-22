@@ -124,4 +124,7 @@ void nvenc_set_output_delay(uint32_t delay);
 // Selects the NVENC effort profile for encoders created from now on.
 void nvenc_set_screen_profile(uint32_t profile);
 
+// Selects native H.264 factory: 0 auto, 1 NVIDIA, 2 MFT, 3 software.
+void screen_set_encoder_mode(uint32_t mode);
+
 }  // namespace livekit_ffi

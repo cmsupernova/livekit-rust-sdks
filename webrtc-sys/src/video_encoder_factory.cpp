@@ -21,6 +21,7 @@
 #include "api/video_codecs/video_encoder.h"
 #include "api/video_codecs/video_encoder_factory_template.h"
 #include "livekit/objc_video_factory.h"
+#include "livekit/nvenc_timing.h"
 #include "media/base/media_constants.h"
 #include "media/engine/simulcast_encoder_adapter.h"
 #include "rtc_base/logging.h"
@@ -120,6 +121,55 @@ std::unique_ptr<webrtc::VideoEncoder>
 VideoEncoderFactory::InternalFactory::Create(
     const webrtc::Environment& env,
     const webrtc::SdpVideoFormat& format) {
+  const uint32_t isolation_mode =
+      livekit::screen_encoder_mode().load(std::memory_order_relaxed);
+
+  if (isolation_mode == 3) {
+    auto original_format =
+        webrtc::FuzzyMatchSdpVideoFormat(Factory().GetSupportedFormats(), format);
+    if (original_format) {
+      RTC_LOG(LS_INFO) << "Screen encoder isolation: forcing software for "
+                       << format.name;
+      return Factory().Create(env, *original_format);
+    }
+    RTC_LOG(LS_ERROR) << "Software isolation arm does not support " << format.name;
+    return nullptr;
+  }
+
+#if defined(USE_MFT_VIDEO_CODEC)
+  if (isolation_mode == 2) {
+    webrtc::MftVideoEncoderFactory factory;
+    if (webrtc::MftVideoEncoderFactory::IsSupported()) {
+      for (const auto& supported_format : factory.GetSupportedFormats()) {
+        if (supported_format.IsSameCodec(format)) {
+          RTC_LOG(LS_INFO) << "Screen encoder isolation: forcing MFT for "
+                           << format.name;
+          return factory.Create(env, format);
+        }
+      }
+    }
+    RTC_LOG(LS_ERROR) << "MFT isolation arm unavailable for " << format.name;
+    return nullptr;
+  }
+#endif
+
+#if defined(USE_NVIDIA_VIDEO_CODEC)
+  if (isolation_mode == 1) {
+    webrtc::NvidiaVideoEncoderFactory factory;
+    if (webrtc::NvidiaVideoEncoderFactory::IsSupported()) {
+      for (const auto& supported_format : factory.GetSupportedFormats()) {
+        if (supported_format.IsSameCodec(format)) {
+          RTC_LOG(LS_INFO) << "Screen encoder isolation: forcing NVIDIA for "
+                           << format.name;
+          return factory.Create(env, format);
+        }
+      }
+    }
+    RTC_LOG(LS_ERROR) << "NVIDIA isolation arm unavailable for " << format.name;
+    return nullptr;
+  }
+#endif
+
   for (const auto& factory : factories_) {
     for (const auto& supported_format : factory->GetSupportedFormats()) {
       if (supported_format.IsSameCodec(format))

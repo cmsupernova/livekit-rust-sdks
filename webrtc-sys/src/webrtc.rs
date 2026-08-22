@@ -41,6 +41,12 @@ pub mod ffi {
         pub latency_us: u64,
         pub latency_max_us: u64,
         pub latency_frames: u64,
+        pub key_wait_us: u64,
+        pub key_wait_max_us: u64,
+        pub key_wait_frames: u64,
+        pub delta_wait_us: u64,
+        pub delta_wait_max_us: u64,
+        pub delta_wait_frames: u64,
         /// Extra NVENC output surfaces currently configured, so a measurement
         /// window records which arm of an A/B produced it.
         pub output_delay: u64,
@@ -101,6 +107,9 @@ pub mod ffi {
         /// for encoders created from now on. Takes effect on the next encoder
         /// creation, never mid-stream.
         fn nvenc_set_screen_profile(profile: u32);
+        /// Selects the native H.264 factory for a staff isolation run:
+        /// 0 auto, 1 NVIDIA, 2 MFT, 3 software.
+        fn screen_set_encoder_mode(mode: u32);
         fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
     }
 }

@@ -95,6 +95,7 @@ class NvidiaH264EncoderImpl : public VideoEncoder {
   // in the same order NVENC returns bitstreams.
   std::deque<PendingFrame> pending_frames_;
   uint32_t output_delay_ = 0;
+  uint32_t screen_profile_ = 2;
   CUcontext cu_context_;
   CUmemorytype cu_memory_type_;
   CUarray cu_scaled_array_;

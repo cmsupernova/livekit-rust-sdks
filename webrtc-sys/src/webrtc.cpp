@@ -218,6 +218,16 @@ livekit_ffi::NvencTiming nvenc_timing_take() {
   out.latency_us = c.latency_us.exchange(0, std::memory_order_relaxed);
   out.latency_max_us = c.latency_max_us.exchange(0, std::memory_order_relaxed);
   out.latency_frames = c.latency_frames.exchange(0, std::memory_order_relaxed);
+  out.key_wait_us = c.key_wait_us.exchange(0, std::memory_order_relaxed);
+  out.key_wait_max_us =
+      c.key_wait_max_us.exchange(0, std::memory_order_relaxed);
+  out.key_wait_frames =
+      c.key_wait_frames.exchange(0, std::memory_order_relaxed);
+  out.delta_wait_us = c.delta_wait_us.exchange(0, std::memory_order_relaxed);
+  out.delta_wait_max_us =
+      c.delta_wait_max_us.exchange(0, std::memory_order_relaxed);
+  out.delta_wait_frames =
+      c.delta_wait_frames.exchange(0, std::memory_order_relaxed);
   // Not drained: it describes the configuration this window ran under.
   out.output_delay = livekit::nvenc_output_delay().load(std::memory_order_relaxed);
   return out;
@@ -227,8 +237,13 @@ void nvenc_set_screen_profile(uint32_t profile) {
   // Unknown ids fall back to the shipped default rather than to whatever the
   // last share happened to set: a stale process-global is the one way this
   // could silently mislabel a measurement window.
-  livekit::nvenc_screen_profile().store(profile > 2 ? 0 : profile,
+  livekit::nvenc_screen_profile().store(profile > 3 ? 2 : profile,
                                         std::memory_order_relaxed);
+}
+
+void screen_set_encoder_mode(uint32_t mode) {
+  livekit::screen_encoder_mode().store(mode > 3 ? 0 : mode,
+                                       std::memory_order_relaxed);
 }
 
 void nvenc_set_output_delay(uint32_t delay) {

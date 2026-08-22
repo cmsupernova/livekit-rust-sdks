@@ -131,6 +131,11 @@ class NvEncoder {
   virtual void EncodeFrame(std::vector<std::vector<uint8_t>>& vPacket,
                            NV_ENC_PIC_PARAMS* pPicParams = nullptr);
 
+  /// Blocking bitstream wait from the most recent EncodeFrame call. The
+  /// screen-share encoder consumes this after parsing the returned H.264 NALs
+  /// so periodic IDRs can be timed separately from delta frames.
+  uint64_t GetLastBitstreamWaitUs() const { return m_lastBitstreamWaitUs; }
+
   /**
    *  @brief  This function to flush the encoder queue.
    *  The encoder might be queuing frames for B picture encoding or lookahead;
@@ -482,6 +487,7 @@ class NvEncoder {
   int32_t m_iGot = 0;
   int32_t m_nEncoderBuffer = 0;
   int32_t m_nOutputDelay = 0;
+  uint64_t m_lastBitstreamWaitUs = 0;
   IVFUtils m_IVFUtils;
   bool m_bWriteIVFFileHeader = true;
   bool m_bUseIVFContainer = true;
