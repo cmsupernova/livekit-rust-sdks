@@ -69,8 +69,8 @@ pub mod native {
     pub use webrtc_sys::webrtc::ffi::create_random_uuid;
     /// Aggregated NVENC copy/submit/wait timing, drained on read.
     pub use webrtc_sys::webrtc::ffi::{
-        nvenc_set_output_delay, nvenc_set_screen_profile, nvenc_timing_take,
-        screen_set_encoder_mode, NvencTiming,
+        mft_diag_read, nvenc_set_output_delay, nvenc_set_screen_profile, nvenc_timing_take,
+        screen_set_encoder_mode, MftDiag, NvencTiming,
     };
 
     pub use crate::imp::{apm, audio_mixer, audio_resampler, frame_cryptor, yuv_helper};

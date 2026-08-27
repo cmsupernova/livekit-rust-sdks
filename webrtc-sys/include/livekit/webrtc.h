@@ -127,4 +127,8 @@ void nvenc_set_screen_profile(uint32_t profile);
 // Selects native H.264 factory: 0 auto, 1 NVIDIA, 2 MFT, 3 software.
 void screen_set_encoder_mode(uint32_t mode);
 
+// Reads (does not drain) the MFT diagnostic state: stage/hr of the last MFT
+// encoder attempt plus factory registration flags. See nvenc_timing.h.
+livekit_ffi::MftDiag mft_diag_read();
+
 }  // namespace livekit_ffi

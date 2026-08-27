@@ -241,8 +241,17 @@ void nvenc_set_screen_profile(uint32_t profile) {
                                         std::memory_order_relaxed);
 }
 
+livekit_ffi::MftDiag mft_diag_read() {
+  auto& d = livekit::mft_diag();
+  livekit_ffi::MftDiag out{};
+  out.stage = d.stage.load(std::memory_order_relaxed);
+  out.hr = d.hr.load(std::memory_order_relaxed);
+  out.flags = d.flags.load(std::memory_order_relaxed);
+  return out;
+}
+
 void screen_set_encoder_mode(uint32_t mode) {
-  livekit::screen_encoder_mode().store(mode > 3 ? 0 : mode,
+  livekit::screen_encoder_mode().store(mode > 4 ? 0 : mode,
                                        std::memory_order_relaxed);
 }
 

@@ -113,6 +113,44 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // 0 keeps the normal factory order, while 1/2/3 force the existing NVIDIA,
 // MFT, or software H.264 path. It is intentionally process-global: Rift has
 // one native screen publisher and camera remains in WebView2 today.
+// Media Foundation encoder diagnostics.
+//
+// An AMD field test (RX 6900 XT) ran seven shares across five staff arms and
+// every one silently produced OpenH264 software, including the arm that
+// explicitly forced MFT. Nothing in the diagnostics said why: the MFT failure
+// HRESULTs only went to RTC_LOG, which the desktop log file does not capture.
+// These atomics carry the last MFT attempt's outcome to the app's own logs:
+// which stage failed, with what HRESULT, and what the factory registration
+// actually looked like.
+//
+// Stages: 0 not attempted, 1 MFStartup failed, 2 hardware enum found nothing
+// (software enum tried next), 3 no MFT at all, 4 ActivateObject failed,
+// 5 async unlock failed, 6 SetOutputType failed, 7 SetInputType failed,
+// 8 event generator unavailable, 9 begin/start streaming failed,
+// 10 initialized, 11 async feed timeout at runtime, 12 ProcessInput failed.
+//
+// Flags: 1 NVIDIA factory registered, 2 MFT factory registered, 4 active MFT
+// is async, 8 active MFT is hardware, 16 software-MFT enum fallback used.
+struct MftDiagCounters {
+  std::atomic<uint32_t> stage{0};
+  std::atomic<uint32_t> hr{0};
+  std::atomic<uint32_t> flags{0};
+};
+
+inline MftDiagCounters& mft_diag() {
+  static MftDiagCounters d;
+  return d;
+}
+
+inline void mft_diag_stage(uint32_t stage, uint32_t hr) {
+  mft_diag().stage.store(stage, std::memory_order_relaxed);
+  mft_diag().hr.store(hr, std::memory_order_relaxed);
+}
+
+inline void mft_diag_flag(uint32_t bit) {
+  mft_diag().flags.fetch_or(bit, std::memory_order_relaxed);
+}
+
 inline std::atomic<uint32_t>& screen_encoder_mode() {
   static std::atomic<uint32_t> mode{0};
   return mode;

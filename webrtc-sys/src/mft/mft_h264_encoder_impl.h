@@ -4,9 +4,13 @@
 #include <wrl/client.h>
 
 struct IMFTransform;
+struct IMFMediaEventGenerator;
 struct ICodecAPI;
 
+#include <cstdint>
+#include <deque>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "api/environment/environment.h"
@@ -42,7 +46,14 @@ class MftH264EncoderImpl : public VideoEncoder {
   bool ConfigureInputType();
   bool ConfigureOutputType();
   bool StartStreaming();
-  int32_t ProcessEncodedOutput(const VideoFrame& input_frame);
+  // Drains every event the async MFT has queued, converting them into
+  // input/output credits. Returns false on a fatal event or GetEvent failure.
+  bool PumpMftEvents();
+  // Sync MFTs pass the frame whose input produced the output; the async model
+  // passes nullptr and stamps from `pending_meta_` instead, matched by sample
+  // time. `single_shot` = consume exactly one HaveOutput credit.
+  int32_t ProcessEncodedOutput(const VideoFrame* input_frame,
+                               bool single_shot);
 
   void I420ToNV12(const I420BufferInterface* i420,
                   uint8_t* nv12_data, int nv12_stride);
@@ -54,7 +65,32 @@ class MftH264EncoderImpl : public VideoEncoder {
   H264BitstreamParser h264_bitstream_parser_;
 
   Microsoft::WRL::ComPtr<IMFTransform> transform_;
+  Microsoft::WRL::ComPtr<IMFMediaEventGenerator> event_gen_;
   ICodecAPI* codec_api_ = nullptr;
+
+  // Hardware MFTs are asynchronous: they boot locked, must be unlocked via
+  // MF_TRANSFORM_ASYNC_UNLOCK, and are then driven by METransformNeedInput /
+  // METransformHaveOutput events rather than blind ProcessInput/ProcessOutput
+  // calls. `input_credits_`/`output_credits_` count events received but not
+  // yet acted on.
+  bool is_async_ = false;
+  int input_credits_ = 0;
+  int output_credits_ = 0;
+
+  // Metadata of frames handed to an async MFT but not yet returned. With a
+  // pipelining encoder the output EncodedImage belongs to an EARLIER input
+  // than the one just submitted; stamping it from the current frame corrupts
+  // RTP timing and A/V sync silently. Matched by MF sample time, which the
+  // transform is required to carry through.
+  struct FrameMeta {
+    int64_t sample_time_100ns = 0;
+    uint32_t rtp_timestamp = 0;
+    int64_t ntp_time_ms = 0;
+    int64_t render_time_ms = 0;
+    VideoRotation rotation = kVideoRotation_0;
+    std::optional<ColorSpace> color_space;
+  };
+  std::deque<FrameMeta> pending_meta_;
 
   uint32_t width_ = 0;
   uint32_t height_ = 0;

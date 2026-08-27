@@ -62,6 +62,67 @@ using Factory = webrtc::VideoEncoderFactoryTemplate<
 #endif
     webrtc::LibvpxVp9EncoderTemplateAdapter>;
 
+namespace {
+
+// Staff isolation arm: the stock software H.264 encoder with the codec mode
+// rewritten from kScreensharing to kRealtimeVideo at InitEncode.
+//
+// Why: an AMD field run whose shares all fell back to OpenH264 encoded
+// entire 2s windows as ALL keyframes (56 of 62 frames in one window) with
+// ~0 PLI/FIR from viewers, so no one asked for them. OpenH264's
+// SCREEN_CONTENT_REAL_TIME usage runs a scene-change detector that promotes
+// frames to IDR on its own, and a fullscreen game changes most of the frame
+// most of the time. Every IDR costs several P-frames' worth of CPU, which is
+// the observed 90%+ CPU and 3-18fps output. The detector lives inside the
+// prebuilt libwebrtc binary where it cannot be flipped directly; the camera
+// usage mode does not run it. This wrapper is the controlled experiment for
+// that hypothesis, and if it holds it is also the production shape for the
+// software fallback.
+class CameraModeH264Encoder : public webrtc::VideoEncoder {
+ public:
+  explicit CameraModeH264Encoder(std::unique_ptr<webrtc::VideoEncoder> inner)
+      : inner_(std::move(inner)) {}
+
+  int32_t InitEncode(const webrtc::VideoCodec* codec_settings,
+                     const Settings& settings) override {
+    webrtc::VideoCodec camera = *codec_settings;
+    camera.mode = webrtc::VideoCodecMode::kRealtimeVideo;
+    return inner_->InitEncode(&camera, settings);
+  }
+  int32_t RegisterEncodeCompleteCallback(
+      webrtc::EncodedImageCallback* callback) override {
+    return inner_->RegisterEncodeCompleteCallback(callback);
+  }
+  int32_t Release() override { return inner_->Release(); }
+  int32_t Encode(
+      const webrtc::VideoFrame& frame,
+      const std::vector<webrtc::VideoFrameType>* frame_types) override {
+    return inner_->Encode(frame, frame_types);
+  }
+  void SetRates(const RateControlParameters& parameters) override {
+    inner_->SetRates(parameters);
+  }
+  void OnPacketLossRateUpdate(float packet_loss_rate) override {
+    inner_->OnPacketLossRateUpdate(packet_loss_rate);
+  }
+  void OnRttUpdate(int64_t rtt_ms) override { inner_->OnRttUpdate(rtt_ms); }
+  void OnLossNotification(const LossNotification& loss_notification) override {
+    inner_->OnLossNotification(loss_notification);
+  }
+  EncoderInfo GetEncoderInfo() const override {
+    EncoderInfo info = inner_->GetEncoderInfo();
+    // Visible in the publisher stats line's `encoder=` field, so a log can
+    // never mistake this arm for the plain software one.
+    info.implementation_name += " (camera-mode)";
+    return info;
+  }
+
+ private:
+  std::unique_ptr<webrtc::VideoEncoder> inner_;
+};
+
+}  // namespace
+
 VideoEncoderFactory::InternalFactory::InternalFactory() {
 #ifdef __APPLE__
   factories_.push_back(livekit_ffi::CreateObjCVideoEncoderFactory());
@@ -74,12 +135,14 @@ VideoEncoderFactory::InternalFactory::InternalFactory() {
 #if defined(USE_NVIDIA_VIDEO_CODEC)
   if (webrtc::NvidiaVideoEncoderFactory::IsSupported()) {
     factories_.push_back(std::make_unique<webrtc::NvidiaVideoEncoderFactory>());
+    livekit::mft_diag_flag(1);
   } else {
 #endif
 
 #if defined(USE_MFT_VIDEO_CODEC)
     if (webrtc::MftVideoEncoderFactory::IsSupported()) {
       factories_.push_back(std::make_unique<webrtc::MftVideoEncoderFactory>());
+      livekit::mft_diag_flag(2);
     }
 #endif
 
@@ -133,6 +196,22 @@ VideoEncoderFactory::InternalFactory::Create(
       return Factory().Create(env, *original_format);
     }
     RTC_LOG(LS_ERROR) << "Software isolation arm does not support " << format.name;
+    return nullptr;
+  }
+
+  if (isolation_mode == 4) {
+    auto original_format =
+        webrtc::FuzzyMatchSdpVideoFormat(Factory().GetSupportedFormats(), format);
+    if (original_format) {
+      auto inner = Factory().Create(env, *original_format);
+      if (inner) {
+        RTC_LOG(LS_INFO)
+            << "Screen encoder isolation: software with camera-mode override";
+        return std::make_unique<CameraModeH264Encoder>(std::move(inner));
+      }
+    }
+    RTC_LOG(LS_ERROR) << "Camera-mode software arm does not support "
+                      << format.name;
     return nullptr;
   }
 
@@ -214,8 +293,20 @@ std::unique_ptr<webrtc::VideoEncoder> VideoEncoderFactory::Create(
     // Primary = internal factory (hardware first), fallback = software factory.
     // Passing nullptr here meant a hardware encoder failing mid-session left a
     // dead track; the software fallback keeps the stream alive.
+    //
+    // EXCEPT while a staff isolation arm is forced. The isolation branches in
+    // InternalFactory::Create fail closed on purpose - and this fallback was
+    // silently re-opening them: an AMD test ran arms forcing NVENC and MFT,
+    // both correctly returned nullptr, and the adapter handed every one of
+    // them OpenH264. Seven sessions of "A/B data" measured the same encoder
+    // seven times and nothing in the logs said so. A forced arm that cannot
+    // build must produce a visibly dead track, because for a diagnostic run
+    // a plausible wrong measurement is strictly worse than no measurement.
+    const uint32_t isolation_mode =
+        livekit::screen_encoder_mode().load(std::memory_order_relaxed);
     encoder = std::make_unique<webrtc::SimulcastEncoderAdapter>(
-        env, internal_factory_.get(), software_factory_.get(), format);
+        env, internal_factory_.get(),
+        isolation_mode != 0 ? nullptr : software_factory_.get(), format);
   }
 
   return encoder;

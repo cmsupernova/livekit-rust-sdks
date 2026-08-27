@@ -52,6 +52,16 @@ pub mod ffi {
         pub output_delay: u64,
     }
 
+    /// Last MFT encoder attempt: which init stage was reached (or failed),
+    /// the failing HRESULT, and factory registration/kind flags. Field
+    /// meanings are documented in nvenc_timing.h next to the counters.
+    #[derive(Debug, Clone, Copy)]
+    pub struct MftDiag {
+        pub stage: u32,
+        pub hr: u32,
+        pub flags: u32,
+    }
+
     #[derive(Debug)]
     #[repr(i32)]
     pub enum MediaType {
@@ -110,6 +120,8 @@ pub mod ffi {
         /// Selects the native H.264 factory for a staff isolation run:
         /// 0 auto, 1 NVIDIA, 2 MFT, 3 software.
         fn screen_set_encoder_mode(mode: u32);
+        /// Current MFT encoder diagnostic state (not drained on read).
+        fn mft_diag_read() -> MftDiag;
         fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
     }
 }
