@@ -1,6 +1,7 @@
 #include "mft_h264_encoder_impl.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <string>
 
@@ -826,7 +827,11 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
     return;
   }
 
-  if (parameters.framerate_fps < 1.0) {
+  // isfinite too, not just the range check: NaN compares false against
+  // everything, so it sails past `< 1.0` and the cast below is UB. Ported
+  // from upstream #1297, which also confirmed our bps->kbps maxBitrate fix.
+  if (!std::isfinite(parameters.framerate_fps) ||
+      parameters.framerate_fps < 1.0) {
     RTC_LOG(LS_WARNING) << "Invalid frame rate: " << parameters.framerate_fps;
     return;
   }

@@ -121,6 +121,42 @@ class CameraModeH264Encoder : public webrtc::VideoEncoder {
   std::unique_ptr<webrtc::VideoEncoder> inner_;
 };
 
+// The production software fallback: the stock template factory, with every
+// H.264 encoder it produces wrapped in CameraModeH264Encoder.
+//
+// Evidence, same machine, same 1080p60 scene, same ~35% GPU load, vsync on:
+// plain OpenH264 in screen-content mode averaged 53.7fps with dips to 30,
+// 14.3ms per frame, and a 4.6% keyframe ratio with windows of 24 IDRs in 2s;
+// camera mode held 60fps flat at 9.2ms per frame with a 0.2% keyframe ratio.
+// The scene-change detector is the whole difference, and it costs a third
+// of the encode budget while feeding viewers a stream of I-frames nobody
+// asked for. Camera tracks already run in camera mode, so wrapping them is a
+// no-op; only screen shares change. Isolation arm 3 (`SW 60`) keeps the
+// unwrapped encoder on purpose so the A/B stays meaningful.
+class CameraModeSoftwareFactory : public webrtc::VideoEncoderFactory {
+ public:
+  std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+    return inner_.GetSupportedFormats();
+  }
+  CodecSupport QueryCodecSupport(
+      const webrtc::SdpVideoFormat& format,
+      std::optional<std::string> scalability_mode) const override {
+    return inner_.QueryCodecSupport(format, scalability_mode);
+  }
+  std::unique_ptr<webrtc::VideoEncoder> Create(
+      const webrtc::Environment& env,
+      const webrtc::SdpVideoFormat& format) override {
+    auto encoder = inner_.Create(env, format);
+    if (encoder && format.name == "H264") {
+      return std::make_unique<CameraModeH264Encoder>(std::move(encoder));
+    }
+    return encoder;
+  }
+
+ private:
+  Factory inner_;
+};
+
 }  // namespace
 
 VideoEncoderFactory::InternalFactory::InternalFactory() {
@@ -271,7 +307,7 @@ VideoEncoderFactory::VideoEncoderFactory() {
   internal_factory_ = std::make_unique<InternalFactory>();
   // Software-only factory (VP8/VP9/AV1 and, where built, OpenH264) used as the
   // SimulcastEncoderAdapter fallback below.
-  software_factory_ = std::make_unique<Factory>();
+  software_factory_ = std::make_unique<CameraModeSoftwareFactory>();
 }
 
 std::vector<webrtc::SdpVideoFormat> VideoEncoderFactory::GetSupportedFormats()

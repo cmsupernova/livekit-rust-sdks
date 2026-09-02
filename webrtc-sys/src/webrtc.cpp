@@ -253,6 +253,17 @@ livekit_ffi::MftDiag mft_diag_read() {
 void screen_set_encoder_mode(uint32_t mode) {
   livekit::screen_encoder_mode().store(mode > 4 ? 0 : mode,
                                        std::memory_order_relaxed);
+  // Every share start passes through here, which makes it the right place
+  // to clear the previous MFT attempt. The encoder impl resets its own
+  // diagnostics only when an MFT is actually constructed, so after one
+  // failed MF arm every later NVENC/software session carried
+  // `mft_stage=set-output-failed` in its stats line (seen across 19
+  // consecutive healthy sessions in a field log). Registration bits (1, 2)
+  // describe the process, not the attempt, and survive.
+  auto& d = livekit::mft_diag();
+  d.stage.store(0, std::memory_order_relaxed);
+  d.hr.store(0, std::memory_order_relaxed);
+  d.flags.fetch_and(3u, std::memory_order_relaxed);
 }
 
 void nvenc_set_output_delay(uint32_t delay) {
