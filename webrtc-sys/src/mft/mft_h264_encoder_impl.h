@@ -43,6 +43,8 @@ class MftH264EncoderImpl : public VideoEncoder {
 
  private:
   bool CreateMftEncoder();
+  bool ConfigureCodecBeforeMediaType();
+  bool ReadBackRateControl();
   bool ConfigureInputType();
   bool ConfigureOutputType();
   bool StartStreaming();
@@ -99,6 +101,7 @@ class MftH264EncoderImpl : public VideoEncoder {
   bool sending_ = false;
   bool key_frame_request_ = false;
   bool mf_started_ = false;
+  bool bitrate_failure_logged_ = false;
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
 

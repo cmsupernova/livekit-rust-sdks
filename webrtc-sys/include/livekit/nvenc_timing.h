@@ -127,10 +127,15 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // (software enum tried next), 3 no MFT at all, 4 ActivateObject failed,
 // 5 async unlock failed, 6 SetOutputType failed, 7 SetInputType failed,
 // 8 event generator unavailable, 9 begin/start streaming failed,
-// 10 initialized, 11 async feed timeout at runtime, 12 ProcessInput failed.
+// 10 initialized, 11 async feed timeout at runtime, 12 ProcessInput failed,
+// 13 rate control unavailable or a live bitrate update failed. Init failures
+// make production fall back to software; runtime failures remain visible here.
 //
 // Flags: 1 NVIDIA factory registered, 2 MFT factory registered, 4 active MFT
-// is async, 8 active MFT is hardware, 16 software-MFT enum fallback used.
+// is async, 8 active MFT is hardware, 16 software-MFT enum fallback used,
+// 32 CBR was accepted before SetOutputType, 64 CBR readback confirmed it,
+// 128 the initial mean bitrate was accepted before SetOutputType, 256 a live
+// mean-bitrate update was accepted, 512 mean-bitrate readback matched target.
 struct MftDiagCounters {
   std::atomic<uint32_t> stage{0};
   std::atomic<uint32_t> hr{0};

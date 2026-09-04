@@ -159,6 +159,125 @@ bool MftH264EncoderImpl::ConfigureOutputType() {
   return true;
 }
 
+bool MftH264EncoderImpl::ConfigureCodecBeforeMediaType() {
+  if (!codec_api_) {
+    // A live WebRTC encoder must follow congestion-control updates. The media
+    // type can seed a bitrate but cannot provide that contract by itself, so
+    // let SimulcastEncoderAdapter select Rift's software fallback.
+    RTC_LOG(LS_WARNING)
+        << "MFT exposes no ICodecAPI; falling back to software H264";
+    livekit::mft_diag_stage(13, static_cast<uint32_t>(E_NOINTERFACE));
+    return false;
+  }
+
+  // Rate-control mode is a STATIC property. Microsoft documents that it only
+  // takes effect after SetOutputType, so this must precede
+  // ConfigureOutputType(). Setting it later in StartStreaming can return
+  // success while leaving a vendor MFT in its default quality/VBR mode.
+  VARIANT rc;
+  VariantInit(&rc);
+  rc.vt = VT_UI4;
+  rc.ulVal = eAVEncCommonRateControlMode_CBR;
+  HRESULT hr = codec_api_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &rc);
+  if (SUCCEEDED(hr)) {
+    livekit::mft_diag_flag(32);
+  } else {
+    RTC_LOG(LS_WARNING) << "MFT rejected CBR before SetOutputType: 0x"
+                        << std::hex << hr;
+    livekit::mft_diag_stage(13, static_cast<uint32_t>(hr));
+    return false;
+  }
+
+  // Set both the CodecAPI value and MF_MT_AVG_BITRATE (in
+  // ConfigureOutputType). Certified Windows hardware encoders are expected to
+  // support the former, while the latter keeps older/vendor MFTs usable.
+  VARIANT bitrate;
+  VariantInit(&bitrate);
+  bitrate.vt = VT_UI4;
+  bitrate.ulVal = target_bps_;
+  hr = codec_api_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &bitrate);
+  if (SUCCEEDED(hr)) {
+    livekit::mft_diag_flag(128);
+  } else {
+    RTC_LOG(LS_WARNING) << "MFT rejected initial mean bitrate: 0x" << std::hex
+                        << hr;
+    // MF_MT_AVG_BITRATE is set on the output type as the compatibility path.
+    // A later SetRates call still gets a chance to prove that live updates
+    // work; only inability to select CBR is fatal at initialization.
+  }
+
+  VARIANT low_latency;
+  VariantInit(&low_latency);
+  low_latency.vt = VT_BOOL;
+  low_latency.boolVal = VARIANT_TRUE;
+  hr = codec_api_->SetValue(&CODECAPI_AVLowLatencyMode, &low_latency);
+  if (FAILED(hr)) {
+    RTC_LOG(LS_WARNING) << "MFT rejected low-latency mode: 0x" << std::hex
+                        << hr;
+  }
+
+  VARIANT b_frames;
+  VariantInit(&b_frames);
+  b_frames.vt = VT_UI4;
+  b_frames.ulVal = 0;
+  hr = codec_api_->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &b_frames);
+  if (FAILED(hr)) {
+    RTC_LOG(LS_WARNING) << "MFT rejected zero B-frames: 0x" << std::hex << hr;
+  }
+
+  if (codec_.mode == VideoCodecMode::kScreensharing) {
+    VARIANT gop;
+    VariantInit(&gop);
+    gop.vt = VT_UI4;
+    gop.ulVal = std::max<UINT32>(1u, max_framerate_ * 2);
+    hr = codec_api_->SetValue(&CODECAPI_AVEncMPVGOPSize, &gop);
+    if (FAILED(hr)) {
+      RTC_LOG(LS_WARNING) << "MFT rejected screen-share GOP: 0x" << std::hex
+                          << hr;
+    }
+  }
+  return true;
+}
+
+bool MftH264EncoderImpl::ReadBackRateControl() {
+  if (!codec_api_)
+    return false;
+
+  VARIANT value;
+  VariantInit(&value);
+  HRESULT hr = codec_api_->GetValue(&CODECAPI_AVEncCommonRateControlMode,
+                                    &value);
+  if (SUCCEEDED(hr) && value.vt == VT_UI4) {
+    if (value.ulVal == eAVEncCommonRateControlMode_CBR) {
+      livekit::mft_diag_flag(64);
+    } else {
+      RTC_LOG(LS_WARNING) << "MFT rate-control readback is not CBR: "
+                          << value.ulVal;
+      livekit::mft_diag_stage(13, static_cast<uint32_t>(E_FAIL));
+      VariantClear(&value);
+      return false;
+    }
+  } else {
+    RTC_LOG(LS_WARNING) << "MFT rate-control readback failed: 0x" << std::hex
+                        << hr;
+  }
+  VariantClear(&value);
+
+  VariantInit(&value);
+  hr = codec_api_->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &value);
+  if (SUCCEEDED(hr) && value.vt == VT_UI4) {
+    const uint32_t delta = value.ulVal > target_bps_
+                               ? value.ulVal - target_bps_
+                               : target_bps_ - value.ulVal;
+    const uint32_t tolerance =
+        std::max<uint32_t>(100000u, target_bps_ / 20u);
+    if (delta <= tolerance)
+      livekit::mft_diag_flag(512);
+  }
+  VariantClear(&value);
+  return true;
+}
+
 bool MftH264EncoderImpl::ConfigureInputType() {
   Microsoft::WRL::ComPtr<IMFMediaType> in_type;
   HRESULT hr = MFCreateMediaType(in_type.GetAddressOf());
@@ -191,48 +310,6 @@ bool MftH264EncoderImpl::ConfigureInputType() {
 }
 
 bool MftH264EncoderImpl::StartStreaming() {
-  if (codec_api_) {
-    VARIANT val;
-    VariantInit(&val);
-    val.vt = VT_BOOL;
-    val.boolVal = VARIANT_TRUE;
-    codec_api_->SetValue(&CODECAPI_AVLowLatencyMode, &val);
-
-    // Explicit CBR — AVLowLatencyMode implies CBR on most drivers but
-    // older Intel QSV / AMD MFT variants default to Quality mode and only
-    // respect AVEncCommonMeanBitRate as a hint. Setting the rate control
-    // mode explicitly is defensive and costs nothing when already CBR.
-    VARIANT rc;
-    VariantInit(&rc);
-    rc.vt = VT_UI4;
-    rc.ulVal = eAVEncCommonRateControlMode_CBR;
-    codec_api_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &rc);
-
-    // Force zero B-frames. Base/Constrained Baseline profile already
-    // forbids B-frames, but the CODECAPI is honoured on Main/High and
-    // we pay nothing by setting it on Base, so the safety net holds if
-    // the output profile is ever bumped.
-    VARIANT bp;
-    VariantInit(&bp);
-    bp.vt = VT_UI4;
-    bp.ulVal = 0;
-    codec_api_->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &bp);
-
-    // Screenshare: ~2 s GOP to bound loss recovery. When a loss burst outruns
-    // NACK, receivers otherwise freeze for libwebrtc's ~3 s no-decodable-frame
-    // timeout before requesting a keyframe (observed identically on two
-    // independent viewers); a scheduled IDR caps that at min(next IDR, PLI).
-    // Matches the NVENC path's cadence. Camera streams keep the MFT default
-    // (effectively PLI-driven, as webrtc expects).
-    if (codec_.mode == VideoCodecMode::kScreensharing) {
-      VARIANT gop;
-      VariantInit(&gop);
-      gop.vt = VT_UI4;
-      gop.ulVal = std::max<UINT32>(1u, max_framerate_ * 2);
-      codec_api_->SetValue(&CODECAPI_AVEncMPVGOPSize, &gop);
-    }
-  }
-
   HRESULT hr =
       transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
   if (FAILED(hr)) {
@@ -287,6 +364,9 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
   if (!CreateMftEncoder())
     return WEBRTC_VIDEO_CODEC_ERROR;
 
+  if (!ConfigureCodecBeforeMediaType())
+    return WEBRTC_VIDEO_CODEC_ERROR;
+
   DWORD in_count = 0, out_count = 0;
   hr = transform_->GetStreamCount(&in_count, &out_count);
   if (SUCCEEDED(hr) && in_count > 0 && out_count > 0) {
@@ -297,7 +377,11 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
     }
   }
 
-  if (!ConfigureOutputType() || !ConfigureInputType() || !StartStreaming())
+  if (!ConfigureOutputType())
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  if (!ReadBackRateControl())
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  if (!ConfigureInputType() || !StartStreaming())
     return WEBRTC_VIDEO_CODEC_ERROR;
 
   livekit::mft_diag_stage(10, 0);
@@ -340,6 +424,7 @@ int32_t MftH264EncoderImpl::Release() {
   output_credits_ = 0;
   pending_meta_.clear();
   sending_ = false;
+  bitrate_failure_logged_ = false;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -862,18 +947,71 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
     return;
   }
 
-  target_bps_ = new_target_bps;
   max_framerate_ = new_framerate;
 
   if (codec_api_) {
     VARIANT val;
     VariantInit(&val);
     val.vt = VT_UI4;
-    val.ulVal = target_bps_;
-    codec_api_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
+    val.ulVal = new_target_bps;
+    HRESULT hr =
+        codec_api_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
+    auto& diag = livekit::mft_diag();
+    diag.flags.fetch_and(~512u, std::memory_order_relaxed);
+    if (SUCCEEDED(hr)) {
+      livekit::mft_diag_flag(256);
+
+      VARIANT actual;
+      VariantInit(&actual);
+      HRESULT read_hr =
+          codec_api_->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &actual);
+      if (SUCCEEDED(read_hr) && actual.vt == VT_UI4) {
+        const uint32_t actual_delta = actual.ulVal > new_target_bps
+                                          ? actual.ulVal - new_target_bps
+                                          : new_target_bps - actual.ulVal;
+        const uint32_t tolerance =
+            std::max<uint32_t>(100000u, new_target_bps / 20u);
+        if (actual_delta <= tolerance) {
+          livekit::mft_diag_flag(512);
+          livekit::mft_diag_stage(10, 0);
+          target_bps_ = new_target_bps;
+          bitrate_failure_logged_ = false;
+        } else {
+          // A repeated write of the same value will not make a driver that
+          // clamps or ignores it change its mind, and some MFTs re-prime on a
+          // CODECAPI update. Remember the requested target so ordinary BWE
+          // polling cannot turn this diagnostic into a cadence hitch storm;
+          // the next materially different target still gets a fresh attempt.
+          target_bps_ = new_target_bps;
+          livekit::mft_diag_stage(13, static_cast<uint32_t>(E_FAIL));
+          if (!bitrate_failure_logged_) {
+            bitrate_failure_logged_ = true;
+            RTC_LOG(LS_ERROR)
+                << "MFT accepted but did not apply bitrate update: "
+                << "requested=" << new_target_bps
+                << " readback=" << actual.ulVal;
+          }
+        }
+      } else {
+        // Some vendor MFTs implement SetValue but not GetValue. A successful
+        // setter is still the strongest signal available; trust it while the
+        // application-side realised-bitrate telemetry watches the result.
+        livekit::mft_diag_stage(10, 0);
+        target_bps_ = new_target_bps;
+        bitrate_failure_logged_ = false;
+      }
+      VariantClear(&actual);
+    } else {
+      livekit::mft_diag_stage(13, static_cast<uint32_t>(hr));
+      if (!bitrate_failure_logged_) {
+        bitrate_failure_logged_ = true;
+        RTC_LOG(LS_ERROR) << "MFT rejected live bitrate update to "
+                          << new_target_bps << " bps: 0x" << std::hex << hr;
+      }
+    }
   }
 
-  if (target_bps_ > 0) {
+  if (new_target_bps > 0) {
     if (!sending_)
       key_frame_request_ = true;
     sending_ = true;
