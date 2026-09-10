@@ -11,6 +11,7 @@ struct ICodecAPI;
 #include <deque>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "api/environment/environment.h"
@@ -18,6 +19,7 @@ struct ICodecAPI;
 #include "api/video_codecs/video_encoder.h"
 #include "common_video/h264/h264_bitstream_parser.h"
 #include "modules/video_coding/include/video_codec_interface.h"
+#include "mft_progress_watchdog.h"
 
 namespace webrtc {
 
@@ -51,6 +53,9 @@ class MftH264EncoderImpl : public VideoEncoder {
   // Drains every event the async MFT has queued, converting them into
   // input/output credits. Returns false on a fatal event or GetEvent failure.
   bool PumpMftEvents();
+  int32_t DrainReadyOutput();
+  int32_t FinishEncodeAttempt();
+  int32_t RuntimeFailure(const char* operation, HRESULT hr);
   // Sync MFTs pass the frame whose input produced the output; the async model
   // passes nullptr and stamps from `pending_meta_` instead, matched by sample
   // time. `single_shot` = consume exactly one HaveOutput credit.
@@ -102,6 +107,9 @@ class MftH264EncoderImpl : public VideoEncoder {
   bool key_frame_request_ = false;
   bool mf_started_ = false;
   bool bitrate_failure_logged_ = false;
+  bool runtime_failed_ = false;
+  MftProgressWatchdog progress_;
+  std::string encoder_name_ = "Windows MFT H264 Encoder";
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
 

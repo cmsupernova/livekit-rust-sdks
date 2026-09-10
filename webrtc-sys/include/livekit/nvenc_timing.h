@@ -124,15 +124,18 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // actually looked like.
 //
 // Stages: 0 not attempted, 1 MFStartup failed, 2 hardware enum found nothing
-// (software enum tried next), 3 no MFT at all, 4 ActivateObject failed,
+// (production uses the outer software fallback), 3 no MFT at all (legacy),
+// 4 ActivateObject failed,
 // 5 async unlock failed, 6 SetOutputType failed, 7 SetInputType failed,
 // 8 event generator unavailable, 9 begin/start streaming failed,
 // 10 initialized, 11 async feed timeout at runtime, 12 ProcessInput failed,
-// 13 rate control unavailable or a live bitrate update failed. Init failures
-// make production fall back to software; runtime failures remain visible here.
+// 13 rate control unavailable or a live bitrate update failed,
+// 14 fatal runtime error, 15 sustained no-output stall requesting fallback.
+// Init/runtime failures
+// make production fall back to software; isolation arms remain fail-closed.
 //
 // Flags: 1 NVIDIA factory registered, 2 MFT factory registered, 4 active MFT
-// is async, 8 active MFT is hardware, 16 software-MFT enum fallback used,
+// is async, 8 active MFT is hardware, 16 software-MFT enum fallback used (legacy),
 // 32 CBR was accepted before SetOutputType, 64 CBR readback confirmed it,
 // 128 the initial mean bitrate was accepted before SetOutputType, 256 a live
 // mean-bitrate update was accepted, 512 mean-bitrate readback matched target.

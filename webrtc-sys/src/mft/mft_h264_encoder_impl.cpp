@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <string>
 
@@ -69,21 +70,39 @@ bool MftH264EncoderImpl::CreateMftEncoder() {
                 MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
                 &input_type, &output_type, &activates, &count);
   if (FAILED(hr) || count == 0) {
-    RTC_LOG(LS_WARNING) << "No hardware H.264 MFT found, trying software.";
+    // Software is owned by the outer camera-mode fallback factory. Falling
+    // back to a software MFT here both bypasses that policy and mislabels the
+    // forced-hardware test as a successful hardware encode.
+    RTC_LOG(LS_WARNING) << "No hardware H.264 MFT found.";
     livekit::mft_diag_stage(2, static_cast<uint32_t>(hr));
-    livekit::mft_diag_flag(16);
-    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                   MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-                   &input_type, &output_type, &activates, &count);
-  } else {
-    livekit::mft_diag_flag(8);
-  }
-
-  if (FAILED(hr) || count == 0) {
-    RTC_LOG(LS_ERROR) << "No H.264 MFT encoder available.";
-    livekit::mft_diag_stage(3, static_cast<uint32_t>(hr));
+    if (activates) {
+      for (UINT32 i = 0; i < count; ++i)
+        activates[i]->Release();
+      CoTaskMemFree(activates);
+    }
     return false;
   }
+  livekit::mft_diag_flag(8);
+
+  // Expose the actual vendor MFT in the existing encoder= stats field. A
+  // Radeon desktop with an Intel iGPU may select either; "MFT" alone cannot
+  // tell an AMD test which encoder Windows selected. Query only at init.
+  WCHAR* friendly_name = nullptr;
+  UINT32 name_length = 0;
+  if (SUCCEEDED(activates[0]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
+                                                &friendly_name, &name_length))) {
+    if (friendly_name && name_length > 0 && name_length <= 512) {
+      const int bytes = WideCharToMultiByte(CP_UTF8, 0, friendly_name,
+          static_cast<int>(name_length), nullptr, 0, nullptr, nullptr);
+      if (bytes > 0) {
+        std::string name(bytes, '\0');
+        if (WideCharToMultiByte(CP_UTF8, 0, friendly_name,
+              static_cast<int>(name_length), name.data(), bytes, nullptr, nullptr) == bytes)
+          encoder_name_ += " (" + name + ")";
+      }
+    }
+  }
+  CoTaskMemFree(friendly_name);
 
   hr = activates[0]->ActivateObject(IID_PPV_ARGS(transform_.GetAddressOf()));
   for (UINT32 i = 0; i < count; i++)
@@ -406,53 +425,115 @@ int32_t MftH264EncoderImpl::RegisterEncodeCompleteCallback(
 
 int32_t MftH264EncoderImpl::Release() {
   if (transform_) {
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-    transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    // Async transforms own an event queue and worker resources. Releasing
+    // COM references without Shutdown can leave them alive after fallback.
+    Microsoft::WRL::ComPtr<IMFShutdown> shutdown;
+    if (SUCCEEDED(transform_.As(&shutdown))) {
+      shutdown->Shutdown();
+    } else {
+      transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+      transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    }
     transform_.Reset();
   }
   if (codec_api_) {
     codec_api_->Release();
     codec_api_ = nullptr;
   }
+  event_gen_.Reset();
   if (mf_started_) {
     MFShutdown();
     mf_started_ = false;
   }
-  event_gen_.Reset();
   is_async_ = false;
   input_credits_ = 0;
   output_credits_ = 0;
   pending_meta_.clear();
+  sequence_header_.clear();
+  key_frame_request_ = false;
   sending_ = false;
   bitrate_failure_logged_ = false;
+  runtime_failed_ = false;
+  progress_.Reset();
+  encoder_name_ = "Windows MFT H264 Encoder";
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+int32_t MftH264EncoderImpl::RuntimeFailure(const char* operation, HRESULT hr) {
+  if (!runtime_failed_) {
+    RTC_LOG(LS_ERROR) << "MFT " << operation << " failed: 0x" << std::hex
+                      << hr << std::dec << "; requesting software fallback"
+                      << " input_credits=" << input_credits_
+                      << " output_credits=" << output_credits_
+                      << " pending_frames=" << pending_meta_.size();
+    livekit::mft_diag_stage(14, static_cast<uint32_t>(hr));
+  }
+  runtime_failed_ = true;
+  // A generic ENCODER_FAILURE does not request WebRTC's runtime fallback.
+  // Staff isolation still fails closed because it has no fallback factory.
+  return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+}
+
+int32_t MftH264EncoderImpl::FinishEncodeAttempt() {
+  if (progress_.EndAttempt(GetTickCount64())) {
+    const HRESULT hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    const int32_t result = RuntimeFailure("sustained no-output stall", hr);
+    livekit::mft_diag_stage(15, static_cast<uint32_t>(hr));
+    return result;
+  }
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
 bool MftH264EncoderImpl::PumpMftEvents() {
-  while (true) {
+  // Do not let a broken driver monopolize the encoder thread with events.
+  // Any remainder is consumed on the next pump; credits survive this bound.
+  for (int events = 0; events < 64; ++events) {
     Microsoft::WRL::ComPtr<IMFMediaEvent> event;
     HRESULT hr =
         event_gen_->GetEvent(MF_EVENT_FLAG_NO_WAIT, event.GetAddressOf());
     if (hr == MF_E_NO_EVENTS_AVAILABLE)
       return true;
     if (FAILED(hr) || !event) {
-      RTC_LOG(LS_ERROR) << "MFT GetEvent failed: 0x" << std::hex << hr;
+      RuntimeFailure("GetEvent", FAILED(hr) ? hr : E_UNEXPECTED);
       return false;
     }
     MediaEventType type = MEUnknown;
-    event->GetType(&type);
+    hr = event->GetType(&type);
+    if (FAILED(hr)) {
+      RuntimeFailure("GetType", hr);
+      return false;
+    }
+    HRESULT status = S_OK;
+    hr = event->GetStatus(&status);
+    if (FAILED(hr) || FAILED(status) || type == MEError) {
+      RuntimeFailure("event", FAILED(hr) ? hr : FAILED(status) ? status : E_FAIL);
+      return false;
+    }
     if (type == METransformNeedInput) {
       input_credits_++;
     } else if (type == METransformHaveOutput) {
       output_credits_++;
-    } else if (type == MEError) {
-      HRESULT status = S_OK;
-      event->GetStatus(&status);
-      RTC_LOG(LS_ERROR) << "MFT posted MEError: 0x" << std::hex << status;
+    }
+    if (input_credits_ > 64 || output_credits_ > 64) {
+      RuntimeFailure("event credit overflow", E_UNEXPECTED);
       return false;
     }
     // Drain-complete and marker events carry no work for this drive model.
   }
+  return true;
+}
+
+int32_t MftH264EncoderImpl::DrainReadyOutput() {
+  // Only consume credits already collected by the event pump. Output must
+  // not depend on accepting another input: some drivers stop asking for
+  // input until their completed output has been consumed.
+  while (output_credits_ > 0) {
+    --output_credits_;
+    const int32_t result = ProcessEncodedOutput(nullptr, true);
+    if (result != WEBRTC_VIDEO_CODEC_OK)
+      return result;
+  }
+  return WEBRTC_VIDEO_CODEC_OK;
 }
 
 int32_t MftH264EncoderImpl::Encode(
@@ -462,7 +543,46 @@ int32_t MftH264EncoderImpl::Encode(
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
   if (!callback_)
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+  if (runtime_failed_)
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
 
+  // Preserve keyframe intent even if this input is dropped for backpressure.
+  if (frame_types && !frame_types->empty() &&
+      (*frame_types)[0] == VideoFrameType::kVideoFrameKey)
+    key_frame_request_ = true;
+  if (!sending_) {
+    progress_.Reset();
+    return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
+  }
+  if (frame_types && !frame_types->empty() &&
+      (*frame_types)[0] == VideoFrameType::kEmptyFrame)
+    return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
+
+  progress_.BeginAttempt(GetTickCount64());
+  if (is_async_) {
+    const ULONGLONG feed_deadline = GetTickCount64() + 250;
+    for (;;) {
+      if (!PumpMftEvents())
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      const int32_t result = DrainReadyOutput();
+      if (result != WEBRTC_VIDEO_CODEC_OK)
+        return result;
+      if (input_credits_ > 0)
+        break;
+      if (GetTickCount64() > feed_deadline) {
+        const int32_t result = FinishEncodeAttempt();
+        if (result != WEBRTC_VIDEO_CODEC_OK)
+          return result;
+        // Keep a transient backpressure breadcrumb without per-frame log
+        // spam. Persistent failure is latched and requests fallback above.
+        livekit::mft_diag_stage(11, 0);
+        return WEBRTC_VIDEO_CODEC_OK;
+      }
+      Sleep(1);
+    }
+  }
+
+  // Only allocate/copy pixels after the transform can accept them.
   auto* frame_buffer = input_frame.video_frame_buffer().get();
   const NV12BufferInterface* nv12_buffer = nullptr;
   webrtc::scoped_refptr<I420BufferInterface> i420_buffer;
@@ -474,18 +594,7 @@ int32_t MftH264EncoderImpl::Encode(
       return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
   }
 
-  bool force_key = key_frame_request_ ||
-                   (frame_types && !frame_types->empty() &&
-                    (*frame_types)[0] == VideoFrameType::kVideoFrameKey);
-  if (force_key)
-    key_frame_request_ = false;
-
-  if (!sending_)
-    return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
-
-  if (frame_types && !frame_types->empty() &&
-      (*frame_types)[0] == VideoFrameType::kEmptyFrame)
-    return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
+  const bool force_key = key_frame_request_;
 
   if (force_key && codec_api_) {
     VARIANT val;
@@ -523,12 +632,12 @@ int32_t MftH264EncoderImpl::Encode(
   Microsoft::WRL::ComPtr<IMFMediaBuffer> input_buffer;
   HRESULT hr = MFCreateMemoryBuffer(nv12_size, input_buffer.GetAddressOf());
   if (FAILED(hr))
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return RuntimeFailure("allocate input buffer", hr);
 
   BYTE* buffer_data = nullptr;
   hr = input_buffer->Lock(&buffer_data, nullptr, nullptr);
   if (FAILED(hr))
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return RuntimeFailure("lock input buffer", hr);
 
   if (nv12_buffer) {
     libyuv::CopyPlane(nv12_buffer->DataY(), nv12_buffer->StrideY(),
@@ -539,56 +648,44 @@ int32_t MftH264EncoderImpl::Encode(
     I420ToNV12(i420_buffer.get(), buffer_data, width_);
   }
 
-  input_buffer->Unlock();
-  input_buffer->SetCurrentLength(nv12_size);
+  hr = input_buffer->Unlock();
+  if (FAILED(hr))
+    return RuntimeFailure("unlock input buffer", hr);
+  hr = input_buffer->SetCurrentLength(nv12_size);
+  if (FAILED(hr))
+    return RuntimeFailure("set input buffer length", hr);
 
   Microsoft::WRL::ComPtr<IMFSample> input_sample;
   hr = MFCreateSample(input_sample.GetAddressOf());
   if (FAILED(hr))
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return RuntimeFailure("create input sample", hr);
 
-  input_sample->AddBuffer(input_buffer.Get());
+  hr = input_sample->AddBuffer(input_buffer.Get());
+  if (FAILED(hr))
+    return RuntimeFailure("attach input buffer", hr);
   // MF sample time is in 100-ns units. rtp_timestamp() is a 90kHz RTP tick
   // count, not 100-ns, so feeding it here fed QSV/AMF rate control a bogus
   // timeline. timestamp_us() * 10 converts microseconds to 100-ns units, which
   // matches the SampleDuration below (10^7 100-ns == 1 second).
   const LONGLONG sample_time_100ns =
       static_cast<LONGLONG>(input_frame.timestamp_us()) * 10;
-  input_sample->SetSampleTime(sample_time_100ns);
-  input_sample->SetSampleDuration(10000000LL / max_framerate_);
+  hr = input_sample->SetSampleTime(sample_time_100ns);
+  if (FAILED(hr))
+    return RuntimeFailure("set input sample timestamp", hr);
+  hr = input_sample->SetSampleDuration(10000000LL / max_framerate_);
+  if (FAILED(hr))
+    return RuntimeFailure("set input sample duration", hr);
 
   if (!is_async_) {
     hr = transform_->ProcessInput(input_stream_id_, input_sample.Get(), 0);
     if (FAILED(hr)) {
       RTC_LOG(LS_ERROR) << "MFT ProcessInput failed: 0x" << std::hex << hr;
       livekit::mft_diag_stage(12, static_cast<uint32_t>(hr));
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return RuntimeFailure("ProcessInput", hr);
     }
-    return ProcessEncodedOutput(&input_frame, false);
-  }
-
-  // ---- Async event-model drive ------------------------------------------
-  // One ProcessInput per METransformNeedInput event; ProcessOutput only in
-  // response to METransformHaveOutput. Wait for an input credit with a
-  // non-blocking pump and short sleeps rather than a blocking GetEvent, so a
-  // wedged driver degrades to dropped frames instead of freezing libwebrtc's
-  // encoder thread forever.
-  const ULONGLONG feed_deadline = GetTickCount64() + 250;
-  while (input_credits_ == 0) {
-    if (!PumpMftEvents())
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
-    if (input_credits_ > 0)
-      break;
-    if (GetTickCount64() > feed_deadline) {
-      // The encoder holds our earlier frames and is not asking for more: it
-      // is saturated (a game owning the GPU does this). Dropping the frame
-      // is ordinary backpressure - upstream pacing reads the rate dip - and
-      // must not kill the stream.
-      livekit::mft_diag_stage(11, 0);
-      RTC_LOG(LS_WARNING) << "MFT not accepting input; dropping frame";
-      return WEBRTC_VIDEO_CODEC_OK;
-    }
-    Sleep(1);
+    key_frame_request_ = false;
+    const int32_t result = ProcessEncodedOutput(&input_frame, false);
+    return result == WEBRTC_VIDEO_CODEC_OK ? FinishEncodeAttempt() : result;
   }
 
   FrameMeta meta;
@@ -599,9 +696,10 @@ int32_t MftH264EncoderImpl::Encode(
   meta.rotation = input_frame.rotation();
   meta.color_space = input_frame.color_space();
   pending_meta_.push_back(meta);
-  // Hard bound, mirroring the NVENC pending queue: steady state holds the
-  // encoder's pipeline depth, and anything beyond it means outputs stopped.
-  while (pending_meta_.size() > 8)
+  // Bound metadata, not output latency. Keep enough timestamps for a driver
+  // buffering a burst so later output can still be matched exactly. The
+  // progress watchdog handles a transform that absorbs input indefinitely.
+  while (pending_meta_.size() > 64)
     pending_meta_.pop_front();
 
   hr = transform_->ProcessInput(input_stream_id_, input_sample.Get(), 0);
@@ -609,9 +707,10 @@ int32_t MftH264EncoderImpl::Encode(
     RTC_LOG(LS_ERROR) << "MFT ProcessInput failed: 0x" << std::hex << hr;
     livekit::mft_diag_stage(12, static_cast<uint32_t>(hr));
     pending_meta_.pop_back();
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return RuntimeFailure("ProcessInput", hr);
   }
   input_credits_--;
+  key_frame_request_ = false;
 
   // Deliver with minimal added latency: hardware encoders in low-latency
   // mode return in single-digit milliseconds, so poll briefly for this
@@ -620,20 +719,16 @@ int32_t MftH264EncoderImpl::Encode(
   const ULONGLONG out_deadline = GetTickCount64() + 20;
   for (;;) {
     if (!PumpMftEvents())
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
-    bool delivered = false;
-    while (output_credits_ > 0) {
-      output_credits_--;
-      int32_t res = ProcessEncodedOutput(nullptr, true);
-      if (res != WEBRTC_VIDEO_CODEC_OK)
-        return res;
-      delivered = true;
-    }
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+    const bool delivered = output_credits_ > 0;
+    const int32_t result = DrainReadyOutput();
+    if (result != WEBRTC_VIDEO_CODEC_OK)
+      return result;
     if (delivered || GetTickCount64() > out_deadline)
       break;
     Sleep(1);
   }
-  return WEBRTC_VIDEO_CODEC_OK;
+  return FinishEncodeAttempt();
 }
 
 int32_t MftH264EncoderImpl::ProcessEncodedOutput(
@@ -643,12 +738,12 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
   HRESULT hr =
       transform_->GetOutputStreamInfo(output_stream_id_, &stream_info);
   if (FAILED(hr))
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return RuntimeFailure("GetOutputStreamInfo", hr);
 
-  const bool provides_samples =
-      (stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
-
-  while (true) {
+  for (int outputs = 0; outputs < 64; ++outputs) {
+    const bool provides_samples =
+        (stream_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
+                               MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
     MFT_OUTPUT_DATA_BUFFER output_data = {};
     output_data.dwStreamID = output_stream_id_;
 
@@ -659,24 +754,29 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
           stream_info.cbSize > 0 ? stream_info.cbSize : width_ * height_ * 2;
       hr = MFCreateMemoryBuffer(buf_size, out_buf.GetAddressOf());
       if (FAILED(hr))
-        return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+        return RuntimeFailure("allocate output buffer", hr);
 
       hr = MFCreateSample(our_sample.GetAddressOf());
       if (FAILED(hr))
-        return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
-      our_sample->AddBuffer(out_buf.Get());
+        return RuntimeFailure("create output sample", hr);
+      hr = our_sample->AddBuffer(out_buf.Get());
+      if (FAILED(hr))
+        return RuntimeFailure("attach output buffer", hr);
       output_data.pSample = our_sample.Get();
     }
 
     DWORD status = 0;
     hr = transform_->ProcessOutput(0, 1, &output_data, &status);
 
-    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
-      break;
-    // Async model: ProcessOutput called without a matching HaveOutput event
-    // (a credit accounting slip) answers E_UNEXPECTED. Treat as "nothing to
-    // deliver" rather than an encoder failure.
-    if (single_shot && hr == E_UNEXPECTED)
+    // Own everything the transform returns before branching on HRESULT.
+    // Stream-change and error responses can carry events too.
+    Microsoft::WRL::ComPtr<IMFCollection> output_events;
+    output_events.Attach(output_data.pEvents);
+    Microsoft::WRL::ComPtr<IMFSample> returned_sample;
+    if (output_data.pSample && output_data.pSample != our_sample.Get())
+      returned_sample.Attach(output_data.pSample);
+
+    if (!single_shot && hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
       break;
 
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
@@ -688,9 +788,9 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
       // do NOT inline SPS/PPS in the bitstream by default, and without them
       // the receiver cannot initialize its decoder and shows a black frame
       // for the entire session.
-      bool captured_header = false;
+      bool output_type_set = false;
       DWORD type_index = 0;
-      while (true) {
+      while (type_index < 64) {
         Microsoft::WRL::ComPtr<IMFMediaType> new_output_type;
         HRESULT gt_hr = transform_->GetOutputAvailableType(
             output_stream_id_, type_index, new_output_type.GetAddressOf());
@@ -700,33 +800,41 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
         GUID subtype = {};
         if (SUCCEEDED(new_output_type->GetGUID(MF_MT_SUBTYPE, &subtype)) &&
             subtype == MFVideoFormat_H264) {
+          std::vector<uint8_t> new_header;
           UINT32 header_size = 0;
           if (SUCCEEDED(new_output_type->GetBlobSize(
                   MF_MT_MPEG_SEQUENCE_HEADER, &header_size)) &&
               header_size > 0) {
-            sequence_header_.resize(header_size);
+            new_header.resize(header_size);
             if (SUCCEEDED(new_output_type->GetBlob(
-                    MF_MT_MPEG_SEQUENCE_HEADER, sequence_header_.data(),
+                    MF_MT_MPEG_SEQUENCE_HEADER, new_header.data(),
                     header_size, nullptr))) {
-              captured_header = true;
               RTC_LOG(LS_INFO)
                   << "MFT captured SPS+PPS sequence header (" << header_size
                   << " bytes) for IDR prepend.";
             } else {
-              sequence_header_.clear();
+              new_header.clear();
             }
           }
-          if (FAILED(transform_->SetOutputType(output_stream_id_,
-                                                new_output_type.Get(), 0))) {
-            RTC_LOG(LS_WARNING) << "MFT SetOutputType (post stream change) "
-                                   "failed; falling back to ConfigureOutputType.";
-            ConfigureOutputType();
+          hr = transform_->SetOutputType(output_stream_id_, new_output_type.Get(), 0);
+          if (FAILED(hr)) {
+            ++type_index;
+            continue;
           }
+          sequence_header_ = std::move(new_header);
+          output_type_set = true;
           break;
         }
         type_index++;
       }
-      if (!captured_header && sequence_header_.empty()) {
+      if (!output_type_set) {
+        // Preserve the old compatibility path, but do not pretend success
+        // when it fails or retain a header from a rejected media type.
+        if (!ConfigureOutputType())
+          return RuntimeFailure("negotiate changed output type", MF_E_INVALIDMEDIATYPE);
+        sequence_header_.clear();
+      }
+      if (sequence_header_.empty()) {
         RTC_LOG(LS_WARNING)
             << "MFT stream change did not yield an SPS+PPS header blob; "
                "decoders may be unable to initialize until a subsequent "
@@ -737,20 +845,19 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
       // call ProcessOutput with no pending output.
       if (single_shot)
         return WEBRTC_VIDEO_CODEC_OK;
+      hr = transform_->GetOutputStreamInfo(output_stream_id_, &stream_info);
+      if (FAILED(hr))
+        return RuntimeFailure("refresh output stream info", hr);
       continue;
     }
 
     if (FAILED(hr)) {
-      if (output_data.pEvents)
-        output_data.pEvents->Release();
-      break;
+      return RuntimeFailure("ProcessOutput", hr);
     }
 
     IMFSample* result_sample =
         provides_samples ? output_data.pSample : our_sample.Get();
     if (!result_sample) {
-      if (output_data.pEvents)
-        output_data.pEvents->Release();
       if (single_shot)
         return WEBRTC_VIDEO_CODEC_OK;
       continue;
@@ -772,27 +879,25 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
       have_meta = true;
     } else {
       LONGLONG out_time = 0;
-      if (FAILED(result_sample->GetSampleTime(&out_time)))
-        out_time = -1;
-      if (!pending_meta_.empty()) {
-        // Outputs arrive in submission order. Entries older than this
-        // output are frames the MFT absorbed without emitting (rate-control
-        // drops); their metadata must never be applied to a later bitstream.
-        while (pending_meta_.size() > 1 &&
-               pending_meta_.front().sample_time_100ns < out_time)
-          pending_meta_.pop_front();
-        meta = pending_meta_.front();
-        pending_meta_.pop_front();
+      hr = result_sample->GetSampleTime(&out_time);
+      if (FAILED(hr))
+        return RuntimeFailure("output sample timestamp", hr);
+      const auto match = std::find_if(pending_meta_.begin(), pending_meta_.end(),
+          [out_time](const FrameMeta& entry) {
+            return entry.sample_time_100ns == out_time;
+          });
+      if (match != pending_meta_.end()) {
+        // Earlier entries represent encoder-dropped inputs. An older output
+        // whose metadata aged out must NOT steal the next input's RTP stamp.
+        meta = *match;
+        pending_meta_.erase(pending_meta_.begin(), std::next(match));
         have_meta = true;
       }
     }
     if (!have_meta) {
       RTC_LOG(LS_WARNING)
           << "MFT output with no pending frame metadata; discarding";
-      if (provides_samples && output_data.pSample)
-        output_data.pSample->Release();
-      if (output_data.pEvents)
-        output_data.pEvents->Release();
+      key_frame_request_ = true;
       if (single_shot)
         return WEBRTC_VIDEO_CODEC_OK;
       continue;
@@ -800,18 +905,20 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
 
     Microsoft::WRL::ComPtr<IMFMediaBuffer> result_buffer;
     hr = result_sample->ConvertToContiguousBuffer(result_buffer.GetAddressOf());
-    if (provides_samples && output_data.pSample)
-      output_data.pSample->Release();
-    if (output_data.pEvents)
-      output_data.pEvents->Release();
     if (FAILED(hr))
-      continue;
+      return RuntimeFailure("read output buffer", hr);
 
     BYTE* data = nullptr;
     DWORD data_length = 0;
     hr = result_buffer->Lock(&data, nullptr, &data_length);
-    if (FAILED(hr) || data_length == 0)
+    if (FAILED(hr))
+      return RuntimeFailure("lock output buffer", hr);
+    if (data_length == 0) {
+      result_buffer->Unlock();
+      if (single_shot)
+        return WEBRTC_VIDEO_CODEC_OK;
       continue;
+    }
 
     encoded_image_._encodedWidth = width_;
     encoded_image_._encodedHeight = height_;
@@ -883,6 +990,12 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
       RTC_LOG(LS_ERROR) << "MFT encode callback failed: " << result.error;
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
+    progress_.OutputDelivered(GetTickCount64());
+    // Do not let a past feed timeout look like an active failure after real
+    // output resumed. Leave rate-control errors visible until SetRates fixes
+    // them; a successful bitrate setter is not proof of encoded output.
+    if (livekit::mft_diag().stage.load(std::memory_order_relaxed) == 11)
+      livekit::mft_diag_stage(10, 0);
     if (single_shot)
       return WEBRTC_VIDEO_CODEC_OK;
   }
@@ -893,7 +1006,7 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
 VideoEncoder::EncoderInfo MftH264EncoderImpl::GetEncoderInfo() const {
   EncoderInfo info;
   info.supports_native_handle = false;
-  info.implementation_name = "Windows MFT H264 Encoder";
+  info.implementation_name = encoder_name_;
   info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
   info.is_hardware_accelerated = true;
   info.supports_simulcast = false;
@@ -907,6 +1020,10 @@ VideoEncoder::EncoderInfo MftH264EncoderImpl::GetEncoderInfo() const {
 }
 
 void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
+  // Keep the failure breadcrumb intact while the adapter switches encoders
+  // (or while a fail-closed isolation arm reports the error).
+  if (runtime_failed_)
+    return;
   if (!transform_) {
     RTC_LOG(LS_WARNING) << "MFT SetRates() while uninitialized.";
     return;
@@ -923,6 +1040,7 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
 
   if (parameters.bitrate.get_sum_bps() == 0) {
     sending_ = false;
+    progress_.Reset();
     return;
   }
 
@@ -973,7 +1091,8 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
             std::max<uint32_t>(100000u, new_target_bps / 20u);
         if (actual_delta <= tolerance) {
           livekit::mft_diag_flag(512);
-          livekit::mft_diag_stage(10, 0);
+          if (diag.stage.load(std::memory_order_relaxed) != 11)
+            livekit::mft_diag_stage(10, 0);
           target_bps_ = new_target_bps;
           bitrate_failure_logged_ = false;
         } else {
@@ -996,7 +1115,8 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
         // Some vendor MFTs implement SetValue but not GetValue. A successful
         // setter is still the strongest signal available; trust it while the
         // application-side realised-bitrate telemetry watches the result.
-        livekit::mft_diag_stage(10, 0);
+        if (diag.stage.load(std::memory_order_relaxed) != 11)
+          livekit::mft_diag_stage(10, 0);
         target_bps_ = new_target_bps;
         bitrate_failure_logged_ = false;
       }

@@ -196,6 +196,7 @@ fn main() {
                 .include("src/mft")
                 .file("src/mft/mft_encoder_factory.cpp")
                 .file("src/mft/mft_h264_encoder_impl.cpp")
+                .file("src/mft/mft_progress_watchdog_test.cpp")
                 .define("USE_MFT_VIDEO_CODEC", "1")
                 .flag("/std:c++20")
                 .flag("/EHsc");

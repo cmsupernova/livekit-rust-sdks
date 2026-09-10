@@ -296,7 +296,10 @@ VideoEncoderFactory::InternalFactory::Create(
       webrtc::FuzzyMatchSdpVideoFormat(Factory().GetSupportedFormats(), format);
 
   if (original_format) {
-    return Factory().Create(env, *original_format);
+    // No matching hardware factory is also a production software path, not
+    // only a failed hardware InitEncode. Keep screen-content mode confined
+    // to the explicit software isolation arm above.
+    return CameraModeSoftwareFactory().Create(env, *original_format);
   }
 
   RTC_LOG(LS_ERROR) << "No VideoEncoder found for " << format.name;
