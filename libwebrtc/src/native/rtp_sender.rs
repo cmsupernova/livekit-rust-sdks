@@ -40,26 +40,21 @@ impl RtpSender {
     }
 
     pub async fn get_stats(&self) -> Result<Vec<RtcStats>, RtcError> {
-        let (tx, rx) = oneshot::channel::<Result<Vec<RtcStats>, RtcError>>();
+        let (tx, rx) = oneshot::channel::<String>();
         let ctx = Box::new(sys_rs::SenderContext(Box::new(tx)));
 
         self.sys_handle.get_stats(ctx, |ctx, stats| {
-            let tx = ctx.0.downcast::<oneshot::Sender<Result<Vec<RtcStats>, RtcError>>>().unwrap();
-
-            if stats.is_empty() {
-                let _ = tx.send(Ok(vec![]));
-                return;
+            // Do not parse (or panic) on libwebrtc's C++ callback thread.
+            if let Ok(tx) = ctx.0.downcast::<oneshot::Sender<String>>() {
+                let _ = tx.send(stats);
             }
-
-            // Unwrap because it should not happens
-            let vec = serde_json::from_str(&stats).unwrap();
-            let _ = tx.send(Ok(vec));
         });
 
-        rx.await.map_err(|_| RtcError {
+        let stats = rx.await.map_err(|_| RtcError {
             error_type: RtcErrorType::Internal,
             message: "get_stats cancelled".to_owned(),
-        })?
+        })?;
+        crate::stats::parse_report(&stats)
     }
 
     pub fn set_track(&self, track: Option<MediaStreamTrack>) -> Result<(), RtcError> {

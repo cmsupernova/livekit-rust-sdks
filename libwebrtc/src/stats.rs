@@ -18,6 +18,71 @@ use serde::Deserialize;
 
 use crate::data_channel::DataChannelState;
 
+/// Statistics are optional telemetry, not a reason to abort a media session.
+/// Parse after leaving the C++ callback so a malformed platform report becomes
+/// the existing get_stats error result. Never include the raw report in errors:
+/// it can contain ICE addresses and other connection details.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn parse_report(json: &str) -> Result<Vec<RtcStats>, crate::RtcError> {
+    if json.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(json).map_err(|error| crate::RtcError {
+        error_type: crate::RtcErrorType::Internal,
+        message: format!(
+            "invalid WebRTC stats report ({:?}) at line {}, column {}",
+            error.classify(),
+            error.line(),
+            error.column()
+        ),
+    })
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod report_tests {
+    use super::*;
+
+    #[test]
+    fn empty_reports_remain_valid() {
+        assert!(parse_report("").unwrap().is_empty());
+        assert!(parse_report("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn valid_reports_keep_their_fields() {
+        let reports = parse_report(
+            r#"[{"type":"peer-connection","id":"pc","timestamp":123,"dataChannelsOpened":2}]"#,
+        )
+        .unwrap();
+        let RtcStats::PeerConnection(stats) = &reports[0] else { panic!("wrong stats type") };
+        assert_eq!(stats.rtc.id, "pc");
+        assert_eq!(stats.rtc.timestamp, 123);
+        assert_eq!(stats.pc.data_channels_opened, 2);
+    }
+
+    #[test]
+    fn malformed_or_unsupported_stats_return_errors_without_panicking() {
+        for json in [
+            r#"[{"type":"outbound-rtp",unquoted:1}]"#,
+            r#"[{"type":"outbound-rtp","framesEncoded":NaN}]"#,
+            r#"[{"type":"peer-connection"}"#,
+            r#"[{"type":"future-stats-type"}]"#,
+            "null",
+        ] {
+            assert!(parse_report(json).is_err());
+        }
+        // A failed sample must not poison subsequent requests.
+        assert!(parse_report("[]").is_ok());
+    }
+
+    #[test]
+    fn errors_do_not_leak_report_values() {
+        let error = parse_report(r#"[{"type":"private-connection-detail"}]"#).unwrap_err();
+        assert!(!error.message.contains("private-connection-detail"));
+        assert!(error.message.contains("line 1"));
+    }
+}
+
 /// Values from https://www.w3.org/TR/webrtc-stats/ (NOTE: Some of the structs are not in the SPEC
 /// but inside libwebrtc)
 /// serde will handle the magic of correctly deserializing the json into our structs.
