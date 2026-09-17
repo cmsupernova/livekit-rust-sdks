@@ -44,7 +44,9 @@ class MftH264EncoderImpl : public VideoEncoder {
   EncoderInfo GetEncoderInfo() const override;
 
  private:
-  bool CreateMftEncoder();
+  bool CreateMftEncoder(UINT32 candidate_index, UINT32* candidate_count);
+  int32_t InitEncodeCandidate(const VideoCodec* inst, UINT32 candidate_index,
+                              UINT32* candidate_count);
   bool ConfigureCodecBeforeMediaType();
   bool ReadBackRateControl();
   bool ConfigureInputType();

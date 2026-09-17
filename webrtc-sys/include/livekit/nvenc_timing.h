@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 // Aggregated NVENC timing counters.
@@ -45,6 +46,8 @@ inline constexpr uint64_t kNvencWaitBucketUpperUs[kNvencWaitBucketCount] = {
     250000, 500000, 1000000, 2000000, 4000000, 8000000};
 
 struct NvencTimingCounters {
+  // Not drained: completion histograms cannot describe a call still blocked.
+  std::atomic<uint64_t> active_encode_us{0};
   std::atomic<uint64_t> copy_us{0};
   std::atomic<uint64_t> submit_us{0};
   std::atomic<uint64_t> wait_us{0};
@@ -177,6 +180,21 @@ inline NvencTimingCounters& nvenc_timing() {
   static NvencTimingCounters counters;
   return counters;
 }
+
+inline uint64_t nvenc_now_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+class NvencActiveEncode {
+ public:
+  NvencActiveEncode() {
+    nvenc_timing().active_encode_us.store(nvenc_now_us(), std::memory_order_release);
+  }
+  ~NvencActiveEncode() {
+    nvenc_timing().active_encode_us.store(0, std::memory_order_release);
+  }
+};
 
 // Records one bitstream wait: sum, running maximum, and histogram bucket.
 inline void nvenc_note_wait(uint64_t wait_us) {

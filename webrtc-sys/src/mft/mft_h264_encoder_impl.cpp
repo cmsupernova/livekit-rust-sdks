@@ -59,7 +59,8 @@ void MftH264EncoderImpl::I420ToNV12(const I420BufferInterface* i420,
                        nv12_stride, uv_width, uv_height);
 }
 
-bool MftH264EncoderImpl::CreateMftEncoder() {
+bool MftH264EncoderImpl::CreateMftEncoder(UINT32 candidate_index,
+                                        UINT32* candidate_count) {
   MFT_REGISTER_TYPE_INFO input_type = {MFMediaType_Video, MFVideoFormat_NV12};
   MFT_REGISTER_TYPE_INFO output_type = {MFMediaType_Video, MFVideoFormat_H264};
 
@@ -69,6 +70,7 @@ bool MftH264EncoderImpl::CreateMftEncoder() {
       MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
                 MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
                 &input_type, &output_type, &activates, &count);
+  *candidate_count = count;
   if (FAILED(hr) || count == 0) {
     // Software is owned by the outer camera-mode fallback factory. Falling
     // back to a software MFT here both bypasses that policy and mislabels the
@@ -83,13 +85,18 @@ bool MftH264EncoderImpl::CreateMftEncoder() {
     return false;
   }
   livekit::mft_diag_flag(8);
+  if (candidate_index >= count) {
+    for (UINT32 i = 0; i < count; ++i) activates[i]->Release();
+    CoTaskMemFree(activates);
+    return false;
+  }
 
   // Expose the actual vendor MFT in the existing encoder= stats field. A
   // Radeon desktop with an Intel iGPU may select either; "MFT" alone cannot
   // tell an AMD test which encoder Windows selected. Query only at init.
   WCHAR* friendly_name = nullptr;
   UINT32 name_length = 0;
-  if (SUCCEEDED(activates[0]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
+  if (SUCCEEDED(activates[candidate_index]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
                                                 &friendly_name, &name_length))) {
     if (friendly_name && name_length > 0 && name_length <= 512) {
       const int bytes = WideCharToMultiByte(CP_UTF8, 0, friendly_name,
@@ -104,7 +111,9 @@ bool MftH264EncoderImpl::CreateMftEncoder() {
   }
   CoTaskMemFree(friendly_name);
 
-  hr = activates[0]->ActivateObject(IID_PPV_ARGS(transform_.GetAddressOf()));
+  RTC_LOG(LS_INFO) << "Trying hardware MFT candidate " << candidate_index + 1
+                   << "/" << count << ": " << encoder_name_;
+  hr = activates[candidate_index]->ActivateObject(IID_PPV_ARGS(transform_.GetAddressOf()));
   for (UINT32 i = 0; i < count; i++)
     activates[i]->Release();
   CoTaskMemFree(activates);
@@ -347,6 +356,26 @@ bool MftH264EncoderImpl::StartStreaming() {
 
 int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
                                         const VideoEncoder::Settings&) {
+  // Keep the OS-preferred hardware first. A second adapter is useful only
+  // if it accepts this actual codec/resolution/rate-control configuration.
+  // Startup only: no GPU hopping, no extra simultaneous encoders, and no
+  // change at all for the already-working first candidate.
+  UINT32 count = 1;
+  int32_t result = WEBRTC_VIDEO_CODEC_ERROR;
+  for (UINT32 index = 0; index < count && index < 4; ++index) {
+    result = InitEncodeCandidate(inst, index, &count);
+    if (result == WEBRTC_VIDEO_CODEC_OK || result == WEBRTC_VIDEO_CODEC_ERR_PARAMETER)
+      return result;
+    RTC_LOG(LS_WARNING) << "Hardware MFT candidate " << index + 1
+                        << " failed initialization; checking next candidate";
+    Release();
+  }
+  return result;
+}
+
+int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
+                                               UINT32 candidate_index,
+                                               UINT32* candidate_count) {
   if (!inst || inst->codecType != kVideoCodecH264)
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
   if (inst->maxFramerate == 0 || inst->width < 1 || inst->height < 1)
@@ -372,6 +401,8 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
   encoded_image_.set_size(0);
 
   livekit::mft_diag_stage(0, 0);
+  // Rate-control/async bits belong to this candidate, not a failed predecessor.
+  livekit::mft_diag().flags.fetch_and(3u, std::memory_order_relaxed);
   HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "MFStartup failed: 0x" << std::hex << hr;
@@ -380,7 +411,7 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
   }
   mf_started_ = true;
 
-  if (!CreateMftEncoder())
+  if (!CreateMftEncoder(candidate_index, candidate_count))
     return WEBRTC_VIDEO_CODEC_ERROR;
 
   if (!ConfigureCodecBeforeMediaType())

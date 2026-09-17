@@ -36,6 +36,10 @@ pub mod ffi {
         /// Longest stretch with no encoded output at all: the freeze a viewer
         /// actually sees, which per-frame timings cannot express.
         pub output_gap_max_us: u64,
+        /// Age of an Encode call that has not returned, zero when idle.
+        pub active_encode_age_us: u64,
+        /// Current no-output age only while Encode is active.
+        pub active_output_gap_us: u64,
         /// Submit-to-output residency. `latency_frames` is its own counter
         /// because frames in flight at the drain boundary have no latency yet.
         pub latency_us: u64,

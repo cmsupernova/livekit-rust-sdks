@@ -174,6 +174,15 @@ std::unique_ptr<LogSink> new_log_sink(
 livekit_ffi::NvencTiming nvenc_timing_take() {
   auto& c = livekit::nvenc_timing();
   livekit_ffi::NvencTiming out{};
+  const auto now = livekit::nvenc_now_us();
+  const auto active = c.active_encode_us.load(std::memory_order_acquire);
+  const auto last_output = c.last_output_us.load(std::memory_order_relaxed);
+  // Ignore a call completion/restart racing this snapshot.
+  if (active != 0 && active <= now &&
+      active == c.active_encode_us.load(std::memory_order_acquire)) {
+    out.active_encode_age_us = now - active;
+    if (last_output != 0 && last_output <= now) out.active_output_gap_us = now - last_output;
+  }
   out.copy_us = c.copy_us.exchange(0, std::memory_order_relaxed);
   out.submit_us = c.submit_us.exchange(0, std::memory_order_relaxed);
   out.wait_us = c.wait_us.exchange(0, std::memory_order_relaxed);

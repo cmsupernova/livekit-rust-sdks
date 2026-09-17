@@ -524,6 +524,7 @@ int32_t NvidiaH264EncoderImpl::Encode(
     }
   }
 
+  livekit::NvencActiveEncode active_encode;
   try {
     const NvEncInputFrame* nv_enc_input_frame = encoder_->GetNextInputFrame();
 
