@@ -252,7 +252,7 @@ VideoEncoderFactory::InternalFactory::Create(
   }
 
 #if defined(USE_MFT_VIDEO_CODEC)
-  if (isolation_mode == 2) {
+  if (isolation_mode == 2 || isolation_mode == 5) {
     webrtc::MftVideoEncoderFactory factory;
     if (webrtc::MftVideoEncoderFactory::IsSupported()) {
       for (const auto& supported_format : factory.GetSupportedFormats()) {

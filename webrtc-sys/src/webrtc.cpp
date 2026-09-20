@@ -23,6 +23,7 @@
 #include <memory>
 
 #include "livekit/nvenc_timing.h"
+#include "livekit/mft_timing.h"
 #include "livekit/audio_track.h"
 #include "livekit/media_stream_track.h"
 #include "livekit/rtp_receiver.h"
@@ -260,7 +261,7 @@ livekit_ffi::MftDiag mft_diag_read() {
 }
 
 void screen_set_encoder_mode(uint32_t mode) {
-  livekit::screen_encoder_mode().store(mode > 4 ? 0 : mode,
+  livekit::screen_encoder_mode().store(mode > 5 ? 0 : mode,
                                        std::memory_order_relaxed);
   // Every share start passes through here, which makes it the right place
   // to clear the previous MFT attempt. The encoder impl resets its own
@@ -273,6 +274,34 @@ void screen_set_encoder_mode(uint32_t mode) {
   d.stage.store(0, std::memory_order_relaxed);
   d.hr.store(0, std::memory_order_relaxed);
   d.flags.fetch_and(3u, std::memory_order_relaxed);
+  (void)mft_timing_take();
+}
+
+livekit_ffi::MftTiming mft_timing_take() {
+  auto take_phase = [](livekit::MftPhase& phase) {
+    livekit_ffi::MftPhaseTiming out{};
+    out.total_us = phase.us.exchange(0, std::memory_order_relaxed);
+    out.count = phase.count.exchange(0, std::memory_order_relaxed);
+    out.max_us = phase.max_us.exchange(0, std::memory_order_relaxed);
+    return out;
+  };
+  auto& timing = livekit::mft_timing();
+  livekit_ffi::MftTiming out{};
+  out.input_wait = take_phase(timing.input_wait);
+  out.copy = take_phase(timing.copy);
+  out.submit = take_phase(timing.submit);
+  out.output_wait = take_phase(timing.output_wait);
+  out.output = take_phase(timing.output);
+  out.residence = take_phase(timing.residence);
+  out.output_gap_max_us = timing.output_gap_max_us.exchange(0, std::memory_order_relaxed);
+  out.pending = timing.pending.load(std::memory_order_relaxed);
+  out.pending_max = timing.pending_max.exchange(out.pending, std::memory_order_relaxed);
+  const auto oldest = timing.oldest_pending_us.load(std::memory_order_relaxed);
+  const auto now = livekit::mft_now_us();
+  out.oldest_pending_age_us = out.pending && oldest && now > oldest ? now - oldest : 0;
+  out.dropped = timing.dropped.exchange(0, std::memory_order_relaxed);
+  out.event_driven = timing.event_driven.load(std::memory_order_relaxed);
+  return out;
 }
 
 void nvenc_set_output_delay(uint32_t delay) {

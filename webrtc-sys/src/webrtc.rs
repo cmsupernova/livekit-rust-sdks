@@ -67,6 +67,31 @@ pub mod ffi {
     }
 
     #[derive(Debug)]
+    pub struct MftPhaseTiming {
+        pub total_us: u64,
+        pub count: u64,
+        pub max_us: u64,
+    }
+
+    /// Process-global MFT counters, drained per reporting window. A phase's
+    /// own count is its denominator, not the number of submitted frames.
+    #[derive(Debug)]
+    pub struct MftTiming {
+        pub input_wait: MftPhaseTiming,
+        pub copy: MftPhaseTiming,
+        pub submit: MftPhaseTiming,
+        pub output_wait: MftPhaseTiming,
+        pub output: MftPhaseTiming,
+        pub residence: MftPhaseTiming,
+        pub output_gap_max_us: u64,
+        pub pending: u64,
+        pub pending_max: u64,
+        pub oldest_pending_age_us: u64,
+        pub dropped: u64,
+        pub event_driven: bool,
+    }
+
+    #[derive(Debug)]
     #[repr(i32)]
     pub enum MediaType {
         Audio,
@@ -122,10 +147,11 @@ pub mod ffi {
         /// creation, never mid-stream.
         fn nvenc_set_screen_profile(profile: u32);
         /// Selects the native H.264 factory for a staff isolation run:
-        /// 0 auto, 1 NVIDIA, 2 MFT, 3 software.
+        /// 0 auto, 1 NVIDIA, 2 MFT, 3 software, 4 software-camera, 5 event MFT.
         fn screen_set_encoder_mode(mode: u32);
         /// Current MFT encoder diagnostic state (not drained on read).
         fn mft_diag_read() -> MftDiag;
+        fn mft_timing_take() -> MftTiming;
         fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
     }
 }

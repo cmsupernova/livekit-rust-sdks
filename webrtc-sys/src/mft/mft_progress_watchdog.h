@@ -5,7 +5,8 @@
 
 namespace webrtc {
 
-// Encoder-thread only. A timeout means repeated real Encode attempts with no
+// Caller-serialized (the event-driven arm holds its callback gate). A timeout
+// means repeated real Encode attempts with no
 // delivered bitstream, not low FPS. Idle capture, paused sending and an isolated
 // long scheduler gap must not be mistaken for a broken hardware encoder.
 class MftProgressWatchdog {

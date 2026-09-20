@@ -5,9 +5,11 @@
 
 struct IMFTransform;
 struct IMFMediaEventGenerator;
+struct IMFMediaEvent;
 struct ICodecAPI;
 
 #include <cstdint>
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -44,6 +46,13 @@ class MftH264EncoderImpl : public VideoEncoder {
   EncoderInfo GetEncoderInfo() const override;
 
  private:
+  // Owns the callback lifetime fence. Stop() quiesces callbacks before any
+  // encoder state is released. Only the staff event-driven arm creates it.
+  class EventPump;
+  Microsoft::WRL::ComPtr<EventPump> event_pump_;
+  std::atomic<bool> event_key_frame_request_{false};
+  int32_t event_result_ = 0;
+  bool HandleMftEvent(IMFMediaEvent* event);
   bool CreateMftEncoder(UINT32 candidate_index, UINT32* candidate_count);
   int32_t InitEncodeCandidate(const VideoCodec* inst, UINT32 candidate_index,
                               UINT32* candidate_count);
@@ -62,7 +71,7 @@ class MftH264EncoderImpl : public VideoEncoder {
   // passes nullptr and stamps from `pending_meta_` instead, matched by sample
   // time. `single_shot` = consume exactly one HaveOutput credit.
   int32_t ProcessEncodedOutput(const VideoFrame* input_frame,
-                               bool single_shot);
+                               bool single_shot, uint64_t submitted_us = 0);
 
   void I420ToNV12(const I420BufferInterface* i420,
                   uint8_t* nv12_data, int nv12_stride);
@@ -92,6 +101,7 @@ class MftH264EncoderImpl : public VideoEncoder {
   // RTP timing and A/V sync silently. Matched by MF sample time, which the
   // transform is required to carry through.
   struct FrameMeta {
+    uint64_t submitted_us = 0;
     int64_t sample_time_100ns = 0;
     uint32_t rtp_timestamp = 0;
     int64_t ntp_time_ms = 0;
