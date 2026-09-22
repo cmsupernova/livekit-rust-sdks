@@ -13,7 +13,9 @@ NvidiaVideoEncoderFactory::NvidiaVideoEncoderFactory() {
   // Constrained Baseline, Level 5.2: max 4096x2304@30fps / 2560x1440@60fps / 240 Mbps.
   // Needed because Rift's Forge tier allows up to 2560x1440 screenshare and 1920x1080
   // camera, which would otherwise be rejected by the Level 3.1 cap in `42e01f`.
-  // NvidiaH264EncoderImpl reads this string and passes the level down to NVENC.
+  // NvidiaH264EncoderImpl takes only the profile from the negotiated
+  // profile-level-id; NVENC autoselects the level from the actual resolution,
+  // frame rate and bitrate.
   std::map<std::string, std::string> baselineParameters = {
       {"profile-level-id", "42e034"},
       {"level-asymmetry-allowed", "1"},
@@ -69,17 +71,27 @@ std::unique_ptr<VideoEncoder> NvidiaVideoEncoderFactory::Create(
         }
       }
 
+      // No encoder rather than one bound to a null context: the adapter then
+      // uses its software fallback.
+      CUcontext context = cu_context_->GetContext();
+      if (!context) {
+        RTC_LOG(LS_ERROR) << "CUDA context unavailable; not creating NVENC "
+                             "encoder for "
+                          << format.name;
+        return nullptr;
+      }
+
       if (format.name == "H264") {
         RTC_LOG(LS_INFO) << "Using NVIDIA HW encoder (NVENC) for H264";
         return std::make_unique<NvidiaH264EncoderImpl>(
-            env, cu_context_->GetContext(), CU_MEMORYTYPE_DEVICE,
+            env, context, CU_MEMORYTYPE_DEVICE,
             NV_ENC_BUFFER_FORMAT_NV12, format);
       }
 
       if (format.name == "H265" || format.name == "HEVC") {
         RTC_LOG(LS_INFO) << "Using NVIDIA HW encoder (NVENC) for H265/HEVC";
         return std::make_unique<NvidiaH265EncoderImpl>(
-            env, cu_context_->GetContext(), CU_MEMORYTYPE_DEVICE,
+            env, context, CU_MEMORYTYPE_DEVICE,
             NV_ENC_BUFFER_FORMAT_NV12, format);
       }
     }

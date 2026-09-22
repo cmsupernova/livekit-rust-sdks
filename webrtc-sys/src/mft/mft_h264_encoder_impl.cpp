@@ -578,6 +578,7 @@ int32_t MftH264EncoderImpl::Release() {
   pending_meta_.clear();
   sequence_header_.clear();
   key_frame_request_ = false;
+  last_key_frame_us_ = 0;
   sending_ = false;
   bitrate_failure_logged_ = false;
   runtime_failed_ = false;
@@ -745,6 +746,25 @@ int32_t MftH264EncoderImpl::Encode(
     i420_buffer = frame_buffer->ToI420();
     if (!i420_buffer)
       return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+  }
+
+  // The screen-share GOP is sized once at init (2 s at the init frame rate)
+  // and not changed mid-stream, which some MFTs reject. Once SetRates lowers
+  // the frame rate that GOP spans 4 s at 30 fps and ~18 s at the idle
+  // keep-alive rate, past libwebrtc's ~3 s no-decodable-frame timeout the
+  // 2 s IDR exists to bound. Force an IDR on elapsed time instead; 2.2 s lets
+  // the GOP's own IDR land first at full frame rate.
+  if (codec_.mode == VideoCodecMode::kScreensharing) {
+    constexpr uint64_t kMaxKeyFrameGapUs = 2200000;
+    const uint64_t now_us = livekit::mft_now_us();
+    if (last_key_frame_us_ == 0) {
+      last_key_frame_us_ = now_us;
+    } else if (now_us > last_key_frame_us_ + kMaxKeyFrameGapUs) {
+      key_frame_request_ = true;
+      // Restart the clock at the request, not only at the IDR's output, so a
+      // pipelined MFT is not asked again on every frame in between.
+      last_key_frame_us_ = now_us;
+    }
   }
 
   const bool force_key = key_frame_request_;
@@ -1168,6 +1188,10 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
     progress_.OutputDelivered(GetTickCount64());
     const auto output_now = livekit::mft_now_us();
     livekit::mft_note_output(output_now);
+    // Feeds the screen-share keyframe bound in Encode(). GOP IDRs count too,
+    // and only the NAL parse above can see those.
+    if (encoded_image_._frameType == VideoFrameType::kVideoFrameKey)
+      last_key_frame_us_ = output_now;
     if (meta.submitted_us)
       livekit::mft_timing().residence.Note(output_now - meta.submitted_us);
     // Do not let a past feed timeout look like an active failure after real

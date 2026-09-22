@@ -133,19 +133,23 @@ NvidiaH264EncoderImpl::NvidiaH264EncoderImpl(
       packetization_mode_(
           H264EncoderSettings::Parse(format).packetization_mode),
       format_(format) {
-  std::string hexString = format_.parameters.at("profile-level-id");
-  std::optional<webrtc::H264ProfileLevelId> profile_level_id =
-      webrtc::ParseH264ProfileLevelId(hexString.c_str());
-  if (profile_level_id.has_value()) {
-    profile_ = profile_level_id->profile;
-    level_ = profile_level_id->level;
+  // profile-level-id is optional in an H.264 fmtp (RFC 6184 defaults it to
+  // Baseline), and at() threw std::out_of_range out of this constructor. When
+  // absent, keep the Constrained Baseline default: NVENC has one GUID for both.
+  const auto profile_level_it = format_.parameters.find("profile-level-id");
+  if (profile_level_it != format_.parameters.end()) {
+    std::optional<webrtc::H264ProfileLevelId> profile_level_id =
+        webrtc::ParseH264ProfileLevelId(profile_level_it->second.c_str());
+    if (profile_level_id.has_value()) {
+      profile_ = profile_level_id->profile;
+      level_ = profile_level_id->level;
+    }
   }
 
+  // Not the negotiated level: 42e01f says 3.1, and forcing that made NVENC
+  // signal 3.1 for 2560x1440@60, which needs 5.1. The driver picks the level
+  // from the actual resolution, frame rate and bitrate.
   nv_enc_level_ = NV_ENC_LEVEL_AUTOSELECT;
-  if (level_ != H264Level::kLevel1_b) {
-    // Convert H264Level to NV_ENC_LEVEL.
-    nv_enc_level_ = webrtc::H264LevelToNvEncLevel(level_);
-  }
 
   // Resolve the NVENC profile GUID from the parsed profile. Without this the
   // member stayed uninitialized and later overwrote the encoder's default
@@ -525,6 +529,10 @@ int32_t NvidiaH264EncoderImpl::Encode(
   }
 
   livekit::NvencActiveEncode active_encode;
+  // Set when this frame's metadata is queued, with NVENC's submit count at
+  // that point, so the catch below knows whether NVENC ever took the frame.
+  bool meta_queued = false;
+  int32_t submitted_before = 0;
   try {
     const NvEncInputFrame* nv_enc_input_frame = encoder_->GetNextInputFrame();
 
@@ -564,6 +572,8 @@ int32_t NvidiaH264EncoderImpl::Encode(
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
     pending_frames_.push_back(pending);
+    meta_queued = true;
+    submitted_before = encoder_->GetSubmittedFrameCount();
     // Hard invariant. In steady state this holds exactly `output_delay_`
     // entries. Metadata cannot be dropped independently: NVENC still owns the
     // corresponding encoded frame, so popping only this FIFO would attach its
@@ -607,6 +617,15 @@ int32_t NvidiaH264EncoderImpl::Encode(
     }
   } catch (const NVENCException& e) {
     RTC_LOG(LS_ERROR) << "Failed EncodeFrame NvEncoder " << e.what();
+    // If MapResources or nvEncEncodePicture threw, no packet will ever come
+    // back for this frame, and leaving its entry queued pairs every later
+    // packet with the previous frame's metadata (after a few throws it also
+    // trips the invariant above on every call). If NVENC accepted the frame
+    // and only the bitstream read failed, that packet is still owed: keep it.
+    if (meta_queued && !pending_frames_.empty() &&
+        encoder_->GetSubmittedFrameCount() == submitted_before) {
+      pending_frames_.pop_back();
+    }
     return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
   }
 

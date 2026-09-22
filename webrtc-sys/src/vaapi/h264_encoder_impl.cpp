@@ -39,12 +39,18 @@ VAAPIH264EncoderWrapper::VAAPIH264EncoderWrapper(const webrtc::Environment& env,
       packetization_mode_(
           H264EncoderSettings::Parse(format).packetization_mode),
       format_(format) {
-  std::string hexString = format_.parameters.at("profile-level-id");
-  std::optional<webrtc::H264ProfileLevelId> profile_level_id =
-      webrtc::ParseH264ProfileLevelId(hexString.c_str());
-  if (profile_level_id.has_value()) {
-    profile_ = profile_level_id->profile;
-    level_ = profile_level_id->level;
+  // profile-level-id is optional in an H.264 fmtp (RFC 6184 defaults it to
+  // Baseline), and at() threw std::out_of_range out of this constructor. When
+  // absent, keep the Constrained Baseline default, which GetVAProfile() maps
+  // the same way as Baseline.
+  const auto profile_level_it = format_.parameters.find("profile-level-id");
+  if (profile_level_it != format_.parameters.end()) {
+    std::optional<webrtc::H264ProfileLevelId> profile_level_id =
+        webrtc::ParseH264ProfileLevelId(profile_level_it->second.c_str());
+    if (profile_level_id.has_value()) {
+      profile_ = profile_level_id->profile;
+      level_ = profile_level_id->level;
+    }
   }
 }
 

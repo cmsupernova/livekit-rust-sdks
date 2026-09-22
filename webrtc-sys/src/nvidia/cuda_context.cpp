@@ -168,16 +168,25 @@ bool CudaContext::Initialize() {
 
 CUcontext CudaContext::GetContext() const {
   RTC_DCHECK(cu_context_ != nullptr);
-  // Ensure the context is current
-  CUcontext current;
-  if (cuCtxGetCurrent(&current) != CUDA_SUCCESS) {
-    throw;
+  // Ensure the context is current. Failure returns nullptr and callers skip
+  // the NVIDIA path: the bare `throw;` that was here had no active exception
+  // to rethrow, which is std::terminate and kills the process with no crash
+  // record.
+  CUcontext current = nullptr;
+  CUresult result = cuCtxGetCurrent(&current);
+  if (result != CUDA_SUCCESS) {
+    RTC_LOG(LS_ERROR) << "cuCtxGetCurrent failed: CUresult "
+                      << static_cast<int>(result);
+    return nullptr;
   }
   if (cu_context_ == current) {
     return cu_context_;
   }
-  if (cuCtxSetCurrent(cu_context_) != CUDA_SUCCESS) {
-    throw;
+  result = cuCtxSetCurrent(cu_context_);
+  if (result != CUDA_SUCCESS) {
+    RTC_LOG(LS_ERROR) << "cuCtxSetCurrent failed: CUresult "
+                      << static_cast<int>(result);
+    return nullptr;
   }
   return cu_context_;
 }

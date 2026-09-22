@@ -136,6 +136,11 @@ class NvEncoder {
   /// so periodic IDRs can be timed separately from delta frames.
   uint64_t GetLastBitstreamWaitUs() const { return m_lastBitstreamWaitUs; }
 
+  /// Frames nvEncEncodePicture has accepted. Tells an EncodeFrame throw that
+  /// never reached NVENC apart from one where only the bitstream read failed
+  /// and the packet is still owed.
+  int32_t GetSubmittedFrameCount() const { return m_iToSend; }
+
   /**
    *  @brief  This function to flush the encoder queue.
    *  The encoder might be queuing frames for B picture encoding or lookahead;

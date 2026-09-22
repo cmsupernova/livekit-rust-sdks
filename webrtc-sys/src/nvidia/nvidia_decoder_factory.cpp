@@ -69,7 +69,14 @@ std::vector<SdpVideoFormat> SupportedNvDecoderCodecs(CUcontext context) {
 NvidiaVideoDecoderFactory::NvidiaVideoDecoderFactory()
     : cu_context_(livekit_ffi::CudaContext::GetInstance()) {
   if (cu_context_->Initialize()) {
-    supported_formats_ = SupportedNvDecoderCodecs(cu_context_->GetContext());
+    // Advertise nothing without a usable context, so H.264 stays on the
+    // software decoder instead of querying a null context.
+    CUcontext context = cu_context_->GetContext();
+    if (context) {
+      supported_formats_ = SupportedNvDecoderCodecs(context);
+    } else {
+      RTC_LOG(LS_ERROR) << "CUDA context unavailable; NVDEC disabled.";
+    }
   } else {
     RTC_LOG(LS_ERROR) << "Failed to initialize CUDA context.";
   }
@@ -103,13 +110,20 @@ std::unique_ptr<VideoDecoder> NvidiaVideoDecoderFactory::Create(
           return nullptr;
         }
       }
+      CUcontext context = cu_context_->GetContext();
+      if (!context) {
+        RTC_LOG(LS_ERROR) << "CUDA context unavailable; not creating NVDEC "
+                             "decoder for "
+                          << format.name;
+        return nullptr;
+      }
       if (format.name == "H264") {
         RTC_LOG(LS_INFO) << "Using NVIDIA HW decoder (NVDEC) for H264";
-        return std::make_unique<NvidiaH264DecoderImpl>(cu_context_->GetContext());
+        return std::make_unique<NvidiaH264DecoderImpl>(context);
       }
       if (format.name == "H265" || format.name == "HEVC") {
         RTC_LOG(LS_INFO) << "Using NVIDIA HW decoder (NVDEC) for H265/HEVC";
-        return std::make_unique<NvidiaH265DecoderImpl>(cu_context_->GetContext());
+        return std::make_unique<NvidiaH265DecoderImpl>(context);
       }
     }
   }

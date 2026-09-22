@@ -117,6 +117,11 @@ class MftH264EncoderImpl : public VideoEncoder {
   uint32_t max_framerate_ = 30;
   bool sending_ = false;
   bool key_frame_request_ = false;
+  // mft_now_us() of the last keyframe output (or periodic keyframe request),
+  // for the screen-share IDR bound in Encode(). The event-driven arm writes
+  // it from the pump callback, so like the state above it is only touched
+  // under the pump's lock.
+  uint64_t last_key_frame_us_ = 0;
   bool mf_started_ = false;
   bool bitrate_failure_logged_ = false;
   bool runtime_failed_ = false;
