@@ -119,6 +119,9 @@ constexpr size_t kOpenedTextureCache = 8;
 constexpr DWORD kTextureAcquireMs = 10;
 // Encode-internal: drop this frame and carry on. Never returned to WebRTC.
 constexpr int32_t kSkipFrame = 2;
+// Screen-share QP floor, NVENC's inter value (nvidia/h264_encoder_impl.cpp
+// says why).
+constexpr UINT32 kScreenMinQp = 18;
 
 // MFTEnum2 arrived in Windows 10 1703. It is looked up at run time: as a
 // load-time import it would stop the whole app from starting on older builds.
@@ -441,6 +444,31 @@ bool MftH264EncoderImpl::ConfigureCodecBeforeMediaType() {
       RTC_LOG(LS_WARNING) << "MFT rejected screen-share GOP: 0x" << std::hex
                           << hr;
     }
+
+    // Only ever raised. Vendors ship their own floor (AMF's native H.264
+    // default is 22), and lowering one would spend more on a still screen,
+    // not less. An MFT that cannot report its value keeps it.
+    VARIANT min_qp;
+    VariantInit(&min_qp);
+    hr = codec_api_->GetValue(&CODECAPI_AVEncVideoMinQP, &min_qp);
+    if (SUCCEEDED(hr) && min_qp.vt == VT_UI4) {
+      if (min_qp.ulVal >= kScreenMinQp) {
+        livekit::mft_diag_flag(8192);
+      } else {
+        VARIANT floor;
+        VariantInit(&floor);
+        floor.vt = VT_UI4;
+        floor.ulVal = kScreenMinQp;
+        hr = codec_api_->SetValue(&CODECAPI_AVEncVideoMinQP, &floor);
+        if (SUCCEEDED(hr)) {
+          livekit::mft_diag_flag(4096);
+        } else {
+          RTC_LOG(LS_WARNING) << "MFT rejected screen-share min QP: 0x"
+                              << std::hex << hr;
+        }
+      }
+    }
+    VariantClear(&min_qp);
   }
   return true;
 }

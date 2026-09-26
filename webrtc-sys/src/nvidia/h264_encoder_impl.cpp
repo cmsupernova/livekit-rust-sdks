@@ -45,6 +45,11 @@ uint32_t FrameSizedVbvBuffer(uint32_t bitrate_bps,
   return static_cast<uint32_t>(std::max<uint64_t>(1, bits_per_frame));
 }
 
+// Screen-share QP floor, see InitEncode. The MFT path raises its vendor
+// default to the inter value (mft_h264_encoder_impl.cpp).
+constexpr uint32_t kScreenMinQpInter = 18;
+constexpr uint32_t kScreenMinQpIntra = 16;
+
 }  // namespace
 
 // Used by histograms. Values of entries should not be changed.
@@ -385,6 +390,22 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
                                    configuration_.max_frame_rate) * gop_seconds);
     nv_encode_config_.gopLength = idr_period;
     nv_encode_config_.encodeCodecConfig.h264Config.idrPeriod = idr_period;
+
+    // --- Screenshare QP floor ------------------------------------------------
+    // CBR with no floor spends the whole budget on a still screen. The
+    // one-frame VBV holds each periodic IDR to a coarse QP, and the P-frames
+    // after it then keep refining an unchanged picture toward QP 0 at the full
+    // target rate, until the next IDR starts over. That is uplink voice needed
+    // (field report, Sep 2026: voice breaking up only while sharing). Past QP
+    // 18 the refinement is not visible, so it stops there and a still screen
+    // settles into skip frames a few frames after each IDR. Motion at our
+    // bitrates encodes well above the floor; a simple scene that would dip
+    // under it loses nothing visible. Persists through Reconfigure, which
+    // reuses nv_encode_config_.
+    nv_encode_config_.rcParams.enableMinQP = 1;
+    nv_encode_config_.rcParams.minQP.qpInterP = kScreenMinQpInter;
+    nv_encode_config_.rcParams.minQP.qpInterB = kScreenMinQpInter;
+    nv_encode_config_.rcParams.minQP.qpIntra = kScreenMinQpIntra;
   }
 
   try {

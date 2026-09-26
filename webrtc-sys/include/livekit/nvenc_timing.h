@@ -144,7 +144,8 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // 128 the initial mean bitrate was accepted before SetOutputType, 256 a live
 // mean-bitrate update was accepted, 512 mean-bitrate readback matched target,
 // 1024 texture input came on for the active MFT, 2048 a texture frame reached
-// it.
+// it, 4096 the screen-share min QP was raised to our floor, 8192 the MFT's own
+// min QP was already at or above it (neither: it could not report one).
 //
 // D3D stages (texture input, see d3d_input_requested below), with what the
 // d3d hr field holds: 0 not requested or not a screen share; 1 no hardware

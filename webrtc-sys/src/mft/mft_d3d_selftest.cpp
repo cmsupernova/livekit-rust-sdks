@@ -210,6 +210,8 @@ MftD3dSelfTest mft_d3d_selftest(uint32_t adapter_ordinal,
     livekit::d3d_input_any_vendor().store(true);
     livekit::d3d_input_requested().store(r.adapter_luid);
     auto& diag = livekit::mft_diag();
+    // Flags accumulate for the process; each adapter reports its own.
+    diag.flags.store(0);
     webrtc::VideoCodec codec;
     codec.codecType = webrtc::kVideoCodecH264;
     codec.width = static_cast<uint16_t>(width);
