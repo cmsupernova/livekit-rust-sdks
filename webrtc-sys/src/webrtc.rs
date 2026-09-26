@@ -64,6 +64,9 @@ pub mod ffi {
         pub stage: u32,
         pub hr: u32,
         pub flags: u32,
+        /// Texture input setup outcome and its HRESULT (see nvenc_timing.h).
+        pub d3d_stage: u32,
+        pub d3d_hr: u32,
     }
 
     #[derive(Debug)]
@@ -89,6 +92,10 @@ pub mod ffi {
         pub oldest_pending_age_us: u64,
         pub dropped: u64,
         pub event_driven: bool,
+        /// Frames the MFT took as a GPU texture copy this window.
+        pub texture_frames: u64,
+        /// Frames the MFT took from system memory this window.
+        pub memory_frames: u64,
     }
 
     #[derive(Debug)]
@@ -152,6 +159,14 @@ pub mod ffi {
         /// Current MFT encoder diagnostic state (not drained on read).
         fn mft_diag_read() -> MftDiag;
         fn mft_timing_take() -> MftTiming;
+        /// Offers texture input: the LUID of the adapter the capturer can
+        /// share NV12 textures on, or 0 to withdraw. Read when a screen-share
+        /// MFT is created, never mid-stream.
+        fn screen_set_d3d_input_adapter(luid: u64);
+        /// The adapter LUID a live encoder currently takes texture frames on,
+        /// or 0. Send `NativeBuffer::from_d3d11_texture` frames only while this
+        /// matches the texture's adapter.
+        fn screen_d3d_input_adapter() -> u64;
         fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
     }
 }

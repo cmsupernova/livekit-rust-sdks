@@ -141,11 +141,25 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // is async, 8 active MFT is hardware, 16 software-MFT enum fallback used (legacy),
 // 32 CBR was accepted before SetOutputType, 64 CBR readback confirmed it,
 // 128 the initial mean bitrate was accepted before SetOutputType, 256 a live
-// mean-bitrate update was accepted, 512 mean-bitrate readback matched target.
+// mean-bitrate update was accepted, 512 mean-bitrate readback matched target,
+// 1024 texture input came on for the active MFT, 2048 a texture frame reached
+// it.
+//
+// D3D stages (texture input, see d3d_input_requested below): 0 not requested
+// or not a screen share, 1 no hardware H.264 MFT on the capturer's adapter,
+// 2 the MFT is not D3D11-aware, 3 adapter not found or not on the vendor
+// allowlist, 4 D3D11 device creation failed, 5 no extended resource sharing
+// or NV12 support, 6 DXGI device manager failed, 7 sample allocator failed,
+// 8 the MFT rejected the D3D manager, 9 the MFT failed to initialize with the
+// manager, 10 texture input on, 11 a texture copy or sample failed at runtime
+// and texture input turned off. Every stage but 10 and 11 means the classic
+// system-memory encoder was set up instead, exactly as before.
 struct MftDiagCounters {
   std::atomic<uint32_t> stage{0};
   std::atomic<uint32_t> hr{0};
   std::atomic<uint32_t> flags{0};
+  std::atomic<uint32_t> d3d_stage{0};
+  std::atomic<uint32_t> d3d_hr{0};
 };
 
 inline MftDiagCounters& mft_diag() {
@@ -160,6 +174,35 @@ inline void mft_diag_stage(uint32_t stage, uint32_t hr) {
 
 inline void mft_diag_flag(uint32_t bit) {
   mft_diag().flags.fetch_or(bit, std::memory_order_relaxed);
+}
+
+inline void mft_d3d_stage(uint32_t stage, uint32_t hr) {
+  mft_diag().d3d_stage.store(stage, std::memory_order_relaxed);
+  mft_diag().d3d_hr.store(hr, std::memory_order_relaxed);
+}
+
+// Texture input, OBS's AMF handoff over Media Foundation. The capturer
+// renders NV12 into D3D11 textures shared with a keyed mutex and says which
+// adapter it can share on (its LUID, 0 = none). A screen-share MFT on that
+// same adapter opens them on its own device and copies GPU to GPU instead of
+// reading system-memory frames, and says so through d3d_input_active. The
+// capturer sends textures only while the two agree; everything else stays on
+// the system-memory path.
+inline std::atomic<uint64_t>& d3d_input_requested() {
+  static std::atomic<uint64_t> luid{0};
+  return luid;
+}
+
+inline std::atomic<uint64_t>& d3d_input_active() {
+  static std::atomic<uint64_t> luid{0};
+  return luid;
+}
+
+// Texture input is on an allowlist of adapter vendors (AMD). Tests flip this
+// to exercise the same path on whatever hardware MFT the machine has.
+inline std::atomic<bool>& d3d_input_any_vendor() {
+  static std::atomic<bool> any{false};
+  return any;
 }
 
 inline std::atomic<uint32_t>& screen_encoder_mode() {

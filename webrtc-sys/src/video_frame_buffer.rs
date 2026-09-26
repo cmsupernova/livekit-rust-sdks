@@ -150,6 +150,21 @@ pub mod ffi {
             buffer: &UniquePtr<VideoFrameBuffer>,
         ) -> *mut PlatformImageBuffer;
 
+        /// # SAFETY
+        /// Windows only (null elsewhere). `texture` must be a live
+        /// `ID3D11Texture2D*` for an NV12 texture created with
+        /// `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`, and `shared_handle` its
+        /// `IDXGIResource::GetSharedHandle`. The buffer takes its own COM
+        /// reference. Returns null for invalid arguments.
+        unsafe fn new_d3d11_texture_buffer(
+            texture: *mut u8,
+            shared_handle: usize,
+            texture_id: u64,
+            adapter_luid: u64,
+            width: i32,
+            height: i32,
+        ) -> UniquePtr<VideoFrameBuffer>;
+
         unsafe fn yuv_to_vfb(yuv: *const PlanarYuvBuffer) -> *const VideoFrameBuffer;
         unsafe fn biyuv_to_vfb(yuv: *const BiplanarYuvBuffer) -> *const VideoFrameBuffer;
         unsafe fn yuv8_to_yuv(yuv8: *const PlanarYuv8Buffer) -> *const PlanarYuvBuffer;

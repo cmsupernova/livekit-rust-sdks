@@ -166,6 +166,32 @@ impl NativeBuffer {
         unsafe { vfb_sys::ffi::native_buffer_to_platform_image_buffer(&self.sys_handle) as *mut _ }
     }
 
+    #[cfg(target_os = "windows")]
+    pub unsafe fn from_d3d11_texture(
+        texture: *mut std::ffi::c_void,
+        shared_handle: usize,
+        texture_id: u64,
+        adapter_luid: u64,
+        width: u32,
+        height: u32,
+    ) -> Option<vf::native::NativeBuffer> {
+        let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+            return None;
+        };
+        let sys_handle = vfb_sys::ffi::new_d3d11_texture_buffer(
+            texture as *mut u8,
+            shared_handle,
+            texture_id,
+            adapter_luid,
+            width,
+            height,
+        );
+        if sys_handle.is_null() {
+            return None;
+        }
+        Some(vf::native::NativeBuffer { handle: NativeBuffer { sys_handle } })
+    }
+
     pub fn sys_handle(&self) -> &vfb_sys::ffi::VideoFrameBuffer {
         &self.sys_handle
     }

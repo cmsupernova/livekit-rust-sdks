@@ -45,6 +45,9 @@ struct MftTimingCounters {
   std::atomic<uint64_t> pending{0}, pending_max{0}, dropped{0};
   std::atomic<uint64_t> oldest_pending_us{0};
   std::atomic<bool> event_driven{false};
+  // Frames handed over as a GPU texture copy vs. read from system memory
+  // (including CPU frames uploaded while texture input is on).
+  std::atomic<uint64_t> texture_frames{0}, memory_frames{0};
 };
 
 inline MftTimingCounters& mft_timing() {

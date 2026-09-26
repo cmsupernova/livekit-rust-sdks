@@ -492,6 +492,39 @@ pub mod native {
         pub fn get_cv_pixel_buffer(&self) -> *mut std::ffi::c_void {
             self.handle.get_cv_pixel_buffer()
         }
+
+        /// Wraps an NV12 D3D11 texture shared with a keyed mutex as a frame.
+        ///
+        /// The texture must be created with `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`
+        /// and rendered under key 0 (acquire 0, render, release 0); consumers
+        /// copy it under the same key. A texture-input encoder on the same
+        /// adapter reads it on the GPU (see `native::screen_d3d_input_adapter`);
+        /// anything else reads it back to memory once. The buffer holds its own
+        /// COM reference, so the allocation outlives the producer's ring while
+        /// frames are in flight. `texture_id` must be unique per texture for the
+        /// life of the process. Returns `None` for invalid arguments (odd
+        /// dimensions included).
+        ///
+        /// Safety: `texture` must be a live `ID3D11Texture2D*` and
+        /// `shared_handle` its `IDXGIResource::GetSharedHandle`.
+        #[cfg(target_os = "windows")]
+        pub unsafe fn from_d3d11_texture(
+            texture: *mut std::ffi::c_void,
+            shared_handle: usize,
+            texture_id: u64,
+            adapter_luid: u64,
+            width: u32,
+            height: u32,
+        ) -> Option<Self> {
+            vf_imp::NativeBuffer::from_d3d11_texture(
+                texture,
+                shared_handle,
+                texture_id,
+                adapter_luid,
+                width,
+                height,
+            )
+        }
     }
 
     pub trait VideoFrameBufferExt: VideoBuffer {

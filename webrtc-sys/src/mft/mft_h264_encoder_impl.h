@@ -6,7 +6,14 @@
 struct IMFTransform;
 struct IMFMediaEventGenerator;
 struct IMFMediaEvent;
+struct IMFMediaType;
+struct IMFSample;
+struct ID3D11Texture2D;
 struct ICodecAPI;
+
+namespace livekit_ffi {
+class D3D11TextureBuffer;
+}
 
 #include <cstdint>
 #include <atomic>
@@ -53,12 +60,47 @@ class MftH264EncoderImpl : public VideoEncoder {
   std::atomic<bool> event_key_frame_request_{false};
   int32_t event_result_ = 0;
   bool HandleMftEvent(IMFMediaEvent* event);
-  bool CreateMftEncoder(UINT32 candidate_index, UINT32* candidate_count);
+  // `adapter_luid` 0 enumerates every hardware MFT the classic way;
+  // otherwise only the MFTs on that adapter (MFTEnum2), for texture input.
+  bool CreateMftEncoder(UINT32 candidate_index, UINT32* candidate_count,
+                        uint64_t adapter_luid);
+  // A non-zero `texture_adapter` is a texture-input attempt: the candidate
+  // counts only if texture input actually comes on.
   int32_t InitEncodeCandidate(const VideoCodec* inst, UINT32 candidate_index,
-                              UINT32* candidate_count);
+                              UINT32* candidate_count,
+                              uint64_t texture_adapter);
   bool ConfigureCodecBeforeMediaType();
   bool ReadBackRateControl();
+  long CreateInputType(IMFMediaType** type);
   bool ConfigureInputType();
+
+  // Texture input (see d3d_input_requested in nvenc_timing.h). The MFT gets
+  // its own device on its own adapter; frames arrive as keyed-mutex NV12
+  // textures from the capturer and are copied GPU to GPU into samples from a
+  // D3D11 sample allocator. CPU frames that still arrive are uploaded into
+  // the same samples, since an MFT holding a D3D manager may not take
+  // system memory.
+  struct D3DInput;
+  std::unique_ptr<D3DInput> d3d_;
+  // The active candidate's adapter, 0 if unknown. MFTEnumEx activates often
+  // carry no MFT_ENUM_ADAPTER_LUID, so only a filtered enumeration knows it.
+  uint64_t adapter_luid_ = 0;
+  // The MFT accepted our D3D manager during this candidate's init.
+  bool d3d_attempted_ = false;
+  // Published copy of "texture frames are copied in" for GetEncoderInfo,
+  // which must not race the event pump withdrawing texture input.
+  std::atomic<bool> texture_input_on_{false};
+  bool EnableD3DInput();
+  int32_t AllocateTextureSample(Microsoft::WRL::ComPtr<IMFSample>* sample,
+                                Microsoft::WRL::ComPtr<ID3D11Texture2D>* texture,
+                                UINT* subresource);
+  int32_t TextureSample(const livekit_ffi::D3D11TextureBuffer& frame,
+                        Microsoft::WRL::ComPtr<IMFSample>* sample);
+  int32_t UploadSample(const NV12BufferInterface* nv12,
+                       const I420BufferInterface* i420,
+                       Microsoft::WRL::ComPtr<IMFSample>* sample);
+  int32_t TextureInputFailed(const char* operation, long hr);
+  void WithdrawTextureInput();
   bool ConfigureOutputType();
   bool StartStreaming();
   // Drains every event the async MFT has queued, converting them into

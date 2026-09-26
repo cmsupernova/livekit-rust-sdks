@@ -9,6 +9,8 @@ repository.workspace = true
 
 [features]
 default = []
+# Windows: builds a hardware test of MFT texture input (tests/mft_d3d.rs).
+mft-selftest = []
 
 [dependencies]
 cxx = "1.0"

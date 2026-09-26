@@ -219,6 +219,17 @@ std::unique_ptr<I444Buffer> new_i444_buffer(int width, int height, int stride_y,
 std::unique_ptr<I010Buffer> new_i010_buffer(int width, int height, int stride_y, int stride_u, int stride_v);
 std::unique_ptr<NV12Buffer> new_nv12_buffer(int width, int height, int stride_y, int stride_uv);
 
+// Windows: wraps a keyed-mutex-shared D3D11 NV12 texture (an
+// ID3D11Texture2D*, referenced, not adopted) as a native frame. Null on
+// other platforms or for invalid arguments. See d3d11_texture_buffer.h.
+std::unique_ptr<VideoFrameBuffer> new_d3d11_texture_buffer(
+    uint8_t* texture,
+    size_t shared_handle,
+    uint64_t texture_id,
+    uint64_t adapter_luid,
+    int width,
+    int height);
+
 std::unique_ptr<VideoFrameBuffer> new_native_buffer_from_platform_image_buffer(PlatformImageBuffer *buffer);
 PlatformImageBuffer* native_buffer_to_platform_image_buffer(const std::unique_ptr<VideoFrameBuffer> &);
 

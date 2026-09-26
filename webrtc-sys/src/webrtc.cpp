@@ -257,7 +257,17 @@ livekit_ffi::MftDiag mft_diag_read() {
   out.stage = d.stage.load(std::memory_order_relaxed);
   out.hr = d.hr.load(std::memory_order_relaxed);
   out.flags = d.flags.load(std::memory_order_relaxed);
+  out.d3d_stage = d.d3d_stage.load(std::memory_order_relaxed);
+  out.d3d_hr = d.d3d_hr.load(std::memory_order_relaxed);
   return out;
+}
+
+void screen_set_d3d_input_adapter(uint64_t luid) {
+  livekit::d3d_input_requested().store(luid, std::memory_order_relaxed);
+}
+
+uint64_t screen_d3d_input_adapter() {
+  return livekit::d3d_input_active().load(std::memory_order_relaxed);
 }
 
 void screen_set_encoder_mode(uint32_t mode) {
@@ -274,6 +284,7 @@ void screen_set_encoder_mode(uint32_t mode) {
   d.stage.store(0, std::memory_order_relaxed);
   d.hr.store(0, std::memory_order_relaxed);
   d.flags.fetch_and(3u, std::memory_order_relaxed);
+  livekit::mft_d3d_stage(0, 0);
   (void)mft_timing_take();
 }
 
@@ -301,6 +312,8 @@ livekit_ffi::MftTiming mft_timing_take() {
   out.oldest_pending_age_us = out.pending && oldest && now > oldest ? now - oldest : 0;
   out.dropped = timing.dropped.exchange(0, std::memory_order_relaxed);
   out.event_driven = timing.event_driven.load(std::memory_order_relaxed);
+  out.texture_frames = timing.texture_frames.exchange(0, std::memory_order_relaxed);
+  out.memory_frames = timing.memory_frames.exchange(0, std::memory_order_relaxed);
   return out;
 }
 

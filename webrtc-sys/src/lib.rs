@@ -27,6 +27,8 @@ pub mod helper;
 pub mod jsep;
 pub mod media_stream;
 pub mod media_stream_track;
+#[cfg(all(feature = "mft-selftest", target_os = "windows"))]
+pub mod mft_selftest;
 pub mod peer_connection;
 pub mod peer_connection_factory;
 pub mod prohibit_libsrtp_initialization;

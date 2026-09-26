@@ -60,6 +60,12 @@ fn main() {
         rust_files.push("src/desktop_capturer.rs");
     }
 
+    // Hardware test of MFT texture input; never part of a normal build.
+    let mft_selftest = target_os == "windows" && env::var("CARGO_FEATURE_MFT_SELFTEST").is_ok();
+    if mft_selftest {
+        rust_files.push("src/mft_selftest.rs");
+    }
+
     let mut builder = cxx_build::bridges(rust_files);
 
     builder.files(&[
@@ -194,12 +200,16 @@ fn main() {
 
             builder
                 .include("src/mft")
+                .file("src/d3d11_texture_buffer.cpp")
                 .file("src/mft/mft_encoder_factory.cpp")
                 .file("src/mft/mft_h264_encoder_impl.cpp")
                 .file("src/mft/mft_progress_watchdog_test.cpp")
                 .define("USE_MFT_VIDEO_CODEC", "1")
                 .flag("/std:c++20")
                 .flag("/EHsc");
+            if mft_selftest {
+                builder.file("src/mft/mft_d3d_selftest.cpp");
+            }
         }
         "linux" => {
             println!("cargo:rustc-link-lib=dylib=rt");

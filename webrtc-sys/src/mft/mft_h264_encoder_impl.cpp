@@ -8,6 +8,7 @@
 #include <string>
 #include <wrl/implements.h>
 
+#include <d3d11.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -16,6 +17,7 @@
 #include <codecapi.h>
 #include <wmcodecdsp.h>
 
+#include "livekit/d3d11_texture_buffer.h"
 #include "livekit/nvenc_timing.h"
 #include "livekit/mft_timing.h"
 #include "mft_callback_gate.h"
@@ -99,6 +101,51 @@ class MftH264EncoderImpl::EventPump final
   Microsoft::WRL::ComPtr<IMFMediaEventGenerator> generator_;
 };
 
+namespace {
+
+// Texture input is on for these adapter vendors only: AMD, whose MFT is the
+// production encoder there and whose system-memory path was measured
+// starving (ProcessInput 80-220 ms at 1080p). Other MFTs keep the path they
+// have always had.
+constexpr UINT kAmdVendorId = 0x1002;
+// An async MFT pipelines a few inputs; the allocator saying "empty" is
+// backpressure and drops the frame rather than growing without bound.
+constexpr DWORD kMaxTextureSamples = 8;
+// Opened producer textures kept by id: the capturer's ring across one
+// capture swap.
+constexpr size_t kOpenedTextureCache = 8;
+// The producer holds a texture's mutex only while submitting its render.
+// Waiting longer than this means it is starved; drop the frame.
+constexpr DWORD kTextureAcquireMs = 10;
+// Encode-internal: drop this frame and carry on. Never returned to WebRTC.
+constexpr int32_t kSkipFrame = 2;
+
+}  // namespace
+
+struct MftH264EncoderImpl::D3DInput {
+  ~D3DInput() {
+    if (allocator)
+      allocator->UninitializeSampleAllocator();
+  }
+
+  uint64_t luid = 0;
+  // Texture frames are copied in. Cleared after a runtime texture failure,
+  // which leaves uploads of CPU frames on the same device.
+  bool texture_input = false;
+  Microsoft::WRL::ComPtr<ID3D11Device> device;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+  Microsoft::WRL::ComPtr<IMFDXGIDeviceManager> manager;
+  UINT reset_token = 0;
+  Microsoft::WRL::ComPtr<IMFVideoSampleAllocatorEx> allocator;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> upload;
+  struct Opened {
+    uint64_t id = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> mutex;
+  };
+  std::deque<Opened> opened;
+};
+
 MftH264EncoderImpl::MftH264EncoderImpl(const Environment& env) : env_(env) {}
 
 MftH264EncoderImpl::~MftH264EncoderImpl() { Release(); }
@@ -126,16 +173,47 @@ void MftH264EncoderImpl::I420ToNV12(const I420BufferInterface* i420,
 }
 
 bool MftH264EncoderImpl::CreateMftEncoder(UINT32 candidate_index,
-                                        UINT32* candidate_count) {
+                                        UINT32* candidate_count,
+                                        uint64_t adapter_luid) {
   MFT_REGISTER_TYPE_INFO input_type = {MFMediaType_Video, MFVideoFormat_NV12};
   MFT_REGISTER_TYPE_INFO output_type = {MFMediaType_Video, MFVideoFormat_H264};
 
   IMFActivate** activates = nullptr;
   UINT32 count = 0;
-  HRESULT hr =
-      MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                &input_type, &output_type, &activates, &count);
+  HRESULT hr = S_OK;
+  if (adapter_luid) {
+    // Only the MFTs on the capturer's adapter. MFTEnumEx activates usually
+    // carry no adapter at all, so this is the one way to know which GPU an
+    // encoder sits on.
+    Microsoft::WRL::ComPtr<IMFAttributes> filter;
+    LUID luid{};
+    luid.LowPart = static_cast<DWORD>(adapter_luid & 0xffffffffu);
+    luid.HighPart = static_cast<LONG>(adapter_luid >> 32);
+    hr = MFCreateAttributes(filter.GetAddressOf(), 1);
+    if (SUCCEEDED(hr))
+      hr = filter->SetBlob(MFT_ENUM_ADAPTER_LUID,
+                           reinterpret_cast<const UINT8*>(&luid), sizeof(luid));
+    if (SUCCEEDED(hr))
+      hr = MFTEnum2(MFT_CATEGORY_VIDEO_ENCODER,
+                    MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                    &input_type, &output_type, filter.Get(), &activates,
+                    &count);
+    *candidate_count = count;
+    if (FAILED(hr) || count == 0 || candidate_index >= count) {
+      if (candidate_index == 0)
+        livekit::mft_d3d_stage(1, static_cast<uint32_t>(hr));
+      if (activates) {
+        for (UINT32 i = 0; i < count; ++i)
+          activates[i]->Release();
+        CoTaskMemFree(activates);
+      }
+      return false;
+    }
+  } else {
+    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                   &input_type, &output_type, &activates, &count);
+  }
   *candidate_count = count;
   if (FAILED(hr) || count == 0) {
     // Software is owned by the outer camera-mode fallback factory. Falling
@@ -176,6 +254,18 @@ bool MftH264EncoderImpl::CreateMftEncoder(UINT32 candidate_index,
     }
   }
   CoTaskMemFree(friendly_name);
+
+  // Which adapter this hardware MFT runs on, for texture input: the filter
+  // when there was one, else whatever the activate says (often nothing).
+  adapter_luid_ = adapter_luid;
+  LUID activate_luid{};
+  UINT32 activate_luid_size = 0;
+  if (!adapter_luid_ &&
+      SUCCEEDED(activates[candidate_index]->GetBlob(
+          MFT_ENUM_ADAPTER_LUID, reinterpret_cast<UINT8*>(&activate_luid),
+          sizeof(activate_luid), &activate_luid_size)) &&
+      activate_luid_size == sizeof(activate_luid))
+    adapter_luid_ = livekit_ffi::LuidValue(activate_luid);
 
   RTC_LOG(LS_INFO) << "Trying hardware MFT candidate " << candidate_index + 1
                    << "/" << count << ": " << encoder_name_;
@@ -372,10 +462,10 @@ bool MftH264EncoderImpl::ReadBackRateControl() {
   return true;
 }
 
-bool MftH264EncoderImpl::ConfigureInputType() {
+long MftH264EncoderImpl::CreateInputType(IMFMediaType** type) {
   Microsoft::WRL::ComPtr<IMFMediaType> in_type;
   HRESULT hr = MFCreateMediaType(in_type.GetAddressOf());
-  if (FAILED(hr)) return false;
+  if (FAILED(hr)) return hr;
 
   in_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
   in_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
@@ -393,6 +483,17 @@ bool MftH264EncoderImpl::ConfigureInputType() {
   in_type->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
   in_type->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
   in_type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+  *type = in_type.Detach();
+  return S_OK;
+}
+
+bool MftH264EncoderImpl::ConfigureInputType() {
+  Microsoft::WRL::ComPtr<IMFMediaType> in_type;
+  HRESULT hr = CreateInputType(in_type.GetAddressOf());
+  if (FAILED(hr)) {
+    livekit::mft_diag_stage(7, static_cast<uint32_t>(hr));
+    return false;
+  }
 
   hr = transform_->SetInputType(input_stream_id_, in_type.Get(), 0);
   if (FAILED(hr)) {
@@ -422,6 +523,32 @@ bool MftH264EncoderImpl::StartStreaming() {
 
 int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
                                         const VideoEncoder::Settings&) {
+  // Texture input first, from the MFTs on the capturer's adapter. It counts
+  // only if texture input really comes on; anything short of that (no offer,
+  // not AMD, not D3D11-aware, a failed init with the manager) falls through
+  // to the classic enumeration below, which runs exactly as it always has.
+  const uint64_t texture_adapter =
+      livekit::d3d_input_requested().load(std::memory_order_relaxed);
+  if (inst && inst->mode == VideoCodecMode::kScreensharing &&
+      texture_adapter != 0) {
+    UINT32 count = 1;
+    for (UINT32 index = 0; index < count && index < 4; ++index) {
+      const int32_t result =
+          InitEncodeCandidate(inst, index, &count, texture_adapter);
+      if (result == WEBRTC_VIDEO_CODEC_OK ||
+          result == WEBRTC_VIDEO_CODEC_ERR_PARAMETER)
+        return result;
+      const bool manager_accepted = d3d_attempted_;
+      const uint32_t failed_hr =
+          livekit::mft_diag().hr.load(std::memory_order_relaxed);
+      Release();
+      if (manager_accepted) {
+        RTC_LOG(LS_WARNING) << "MFT failed to initialize with texture input";
+        livekit::mft_d3d_stage(9, failed_hr);
+      }
+    }
+  }
+
   // Keep the OS-preferred hardware first. A second adapter is useful only
   // if it accepts this actual codec/resolution/rate-control configuration.
   // Startup only: no GPU hopping, no extra simultaneous encoders, and no
@@ -429,7 +556,7 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
   UINT32 count = 1;
   int32_t result = WEBRTC_VIDEO_CODEC_ERROR;
   for (UINT32 index = 0; index < count && index < 4; ++index) {
-    result = InitEncodeCandidate(inst, index, &count);
+    result = InitEncodeCandidate(inst, index, &count, /*texture_adapter=*/0);
     if (result == WEBRTC_VIDEO_CODEC_OK || result == WEBRTC_VIDEO_CODEC_ERR_PARAMETER)
       return result;
     RTC_LOG(LS_WARNING) << "Hardware MFT candidate " << index + 1
@@ -441,7 +568,8 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
 
 int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
                                                UINT32 candidate_index,
-                                               UINT32* candidate_count) {
+                                               UINT32* candidate_count,
+                                               uint64_t texture_adapter) {
   if (!inst || inst->codecType != kVideoCodecH264)
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
   if (inst->maxFramerate == 0 || inst->width < 1 || inst->height < 1)
@@ -477,7 +605,7 @@ int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
   }
   mf_started_ = true;
 
-  if (!CreateMftEncoder(candidate_index, candidate_count))
+  if (!CreateMftEncoder(candidate_index, candidate_count, texture_adapter))
     return WEBRTC_VIDEO_CODEC_ERROR;
 
   const bool event_driven =
@@ -487,6 +615,12 @@ int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
     // An isolation run must never silently compare polling against polling.
     return RuntimeFailure("event-driven screen test requires an async MFT", E_NOTIMPL);
   }
+
+  // The D3D manager must reach the MFT before any media type. A texture
+  // attempt that declines (not AMD, not D3D11-aware, any setup failure) ends
+  // here and hands over to the classic path.
+  if (texture_adapter && !EnableD3DInput())
+    return WEBRTC_VIDEO_CODEC_ERROR;
 
   if (!ConfigureCodecBeforeMediaType())
     return WEBRTC_VIDEO_CODEC_ERROR;
@@ -530,6 +664,15 @@ int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
   }
+  if (d3d_ && d3d_->texture_input) {
+    // Only now may the capturer send textures: the MFT holds our manager,
+    // negotiated its types with it, and is streaming.
+    texture_input_on_.store(true, std::memory_order_relaxed);
+    livekit::d3d_input_active().store(d3d_->luid, std::memory_order_relaxed);
+    livekit::mft_d3d_stage(10, 0);
+    livekit::mft_diag_flag(1024);
+    RTC_LOG(LS_INFO) << "MFT texture input on for this encoder";
+  }
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -568,6 +711,12 @@ int32_t MftH264EncoderImpl::Release() {
     codec_api_ = nullptr;
   }
   event_gen_.Reset();
+  // After the transform has let go of our manager and samples, and before
+  // MFShutdown.
+  WithdrawTextureInput();
+  d3d_.reset();
+  adapter_luid_ = 0;
+  d3d_attempted_ = false;
   if (mf_started_) {
     MFShutdown();
     mf_started_ = false;
@@ -597,9 +746,286 @@ int32_t MftH264EncoderImpl::RuntimeFailure(const char* operation, HRESULT hr) {
     livekit::mft_diag_stage(14, static_cast<uint32_t>(hr));
   }
   runtime_failed_ = true;
+  // The software fallback takes over from here; stop the capturer sending
+  // textures now rather than after the adapter swaps encoders.
+  WithdrawTextureInput();
   // A generic ENCODER_FAILURE does not request WebRTC's runtime fallback.
   // Staff isolation still fails closed because it has no fallback factory.
   return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+}
+
+bool MftH264EncoderImpl::EnableD3DInput() {
+  const uint64_t requested =
+      livekit::d3d_input_requested().load(std::memory_order_relaxed);
+  if (codec_.mode != VideoCodecMode::kScreensharing || requested == 0) {
+    livekit::mft_d3d_stage(0, 0);
+    return false;
+  }
+  if (adapter_luid_ == 0 || adapter_luid_ != requested) {
+    livekit::mft_d3d_stage(1, 0);
+    return false;
+  }
+
+  Microsoft::WRL::ComPtr<IMFAttributes> attributes;
+  UINT32 d3d11_aware = 0;
+  if (FAILED(transform_->GetAttributes(attributes.GetAddressOf())) ||
+      !attributes ||
+      FAILED(attributes->GetUINT32(MF_SA_D3D11_AWARE, &d3d11_aware)) ||
+      !d3d11_aware) {
+    livekit::mft_d3d_stage(2, 0);
+    return false;
+  }
+
+  auto adapter = livekit_ffi::FindAdapterByLuid(adapter_luid_);
+  DXGI_ADAPTER_DESC1 adapter_desc{};
+  if (!adapter || FAILED(adapter->GetDesc1(&adapter_desc))) {
+    livekit::mft_d3d_stage(3, static_cast<uint32_t>(E_FAIL));
+    return false;
+  }
+  if (adapter_desc.VendorId != kAmdVendorId &&
+      !livekit::d3d_input_any_vendor().load(std::memory_order_relaxed)) {
+    livekit::mft_d3d_stage(3, adapter_desc.VendorId);
+    return false;
+  }
+
+  auto d3d = std::make_unique<D3DInput>();
+  d3d->luid = adapter_luid_;
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
+                                      D3D_FEATURE_LEVEL_11_0};
+  const UINT flags =
+      D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN,
+                                 nullptr, flags, levels, ARRAYSIZE(levels),
+                                 D3D11_SDK_VERSION, &d3d->device, nullptr,
+                                 &d3d->context);
+  if (hr == E_INVALIDARG) {
+    // Runtimes without 11.1 reject the whole list.
+    hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                           flags, levels + 1, 1, D3D11_SDK_VERSION,
+                           &d3d->device, nullptr, &d3d->context);
+  }
+  if (FAILED(hr)) {
+    livekit::mft_d3d_stage(4, static_cast<uint32_t>(hr));
+    return false;
+  }
+  // The MFT's worker threads use this device alongside the encoder thread.
+  Microsoft::WRL::ComPtr<ID3D10Multithread> multithread;
+  hr = d3d->device.As(&multithread);
+  if (FAILED(hr)) {
+    livekit::mft_d3d_stage(4, static_cast<uint32_t>(hr));
+    return false;
+  }
+  multithread->SetMultithreadProtected(TRUE);
+
+  // Opening another device's NV12 texture needs extended resource sharing.
+  D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+  UINT nv12_support = 0;
+  if (FAILED(d3d->device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS,
+                                              &options, sizeof(options))) ||
+      !options.ExtendedResourceSharing ||
+      FAILED(d3d->device->CheckFormatSupport(DXGI_FORMAT_NV12,
+                                             &nv12_support)) ||
+      !(nv12_support & D3D11_FORMAT_SUPPORT_TEXTURE2D)) {
+    livekit::mft_d3d_stage(5, 0);
+    return false;
+  }
+
+  hr = MFCreateDXGIDeviceManager(&d3d->reset_token,
+                                 d3d->manager.GetAddressOf());
+  if (SUCCEEDED(hr))
+    hr = d3d->manager->ResetDevice(d3d->device.Get(), d3d->reset_token);
+  if (FAILED(hr)) {
+    livekit::mft_d3d_stage(6, static_cast<uint32_t>(hr));
+    return false;
+  }
+
+  // Input samples come from a D3D11 allocator: the MFT hands each back when
+  // done with it, which recycles the texture. Bind flags as OBS gives its
+  // AMF pool textures.
+  Microsoft::WRL::ComPtr<IMFAttributes> allocator_attributes;
+  Microsoft::WRL::ComPtr<IMFMediaType> input_type;
+  hr = MFCreateVideoSampleAllocatorEx(IID_PPV_ARGS(&d3d->allocator));
+  if (SUCCEEDED(hr))
+    hr = d3d->allocator->SetDirectXManager(d3d->manager.Get());
+  if (SUCCEEDED(hr))
+    hr = MFCreateAttributes(allocator_attributes.GetAddressOf(), 2);
+  if (SUCCEEDED(hr)) {
+    UINT32 bind = D3D11_BIND_SHADER_RESOURCE;
+    if (nv12_support & D3D11_FORMAT_SUPPORT_RENDER_TARGET)
+      bind |= D3D11_BIND_RENDER_TARGET;
+    allocator_attributes->SetUINT32(MF_SA_D3D11_BINDFLAGS, bind);
+    allocator_attributes->SetUINT32(MF_SA_D3D11_USAGE, D3D11_USAGE_DEFAULT);
+    hr = CreateInputType(input_type.GetAddressOf());
+  }
+  if (SUCCEEDED(hr))
+    hr = d3d->allocator->InitializeSampleAllocatorEx(
+        2, kMaxTextureSamples, allocator_attributes.Get(), input_type.Get());
+  if (FAILED(hr)) {
+    livekit::mft_d3d_stage(7, static_cast<uint32_t>(hr));
+    return false;
+  }
+
+  hr = transform_->ProcessMessage(
+      MFT_MESSAGE_SET_D3D_MANAGER,
+      reinterpret_cast<ULONG_PTR>(d3d->manager.Get()));
+  if (FAILED(hr)) {
+    livekit::mft_d3d_stage(8, static_cast<uint32_t>(hr));
+    return false;
+  }
+  // From here the MFT is in D3D mode; a failed init retries in memory.
+  d3d_attempted_ = true;
+  d3d->texture_input = true;
+  d3d_ = std::move(d3d);
+  return true;
+}
+
+void MftH264EncoderImpl::WithdrawTextureInput() {
+  texture_input_on_.store(false, std::memory_order_relaxed);
+  if (!d3d_)
+    return;
+  d3d_->texture_input = false;
+  d3d_->opened.clear();
+  uint64_t ours = d3d_->luid;
+  livekit::d3d_input_active().compare_exchange_strong(
+      ours, 0, std::memory_order_relaxed);
+}
+
+int32_t MftH264EncoderImpl::TextureInputFailed(const char* operation,
+                                               long hr) {
+  RTC_LOG(LS_WARNING) << "MFT texture input " << operation << " failed: 0x"
+                      << std::hex << hr
+                      << "; taking frames from memory from here on";
+  livekit::mft_d3d_stage(11, static_cast<uint32_t>(hr));
+  WithdrawTextureInput();
+  return kSkipFrame;
+}
+
+int32_t MftH264EncoderImpl::AllocateTextureSample(
+    Microsoft::WRL::ComPtr<IMFSample>* sample,
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>* texture,
+    UINT* subresource) {
+  HRESULT hr = d3d_->allocator->AllocateSample(sample->ReleaseAndGetAddressOf());
+  if (hr == MF_E_SAMPLEALLOCATOR_EMPTY)
+    return kSkipFrame;
+  if (FAILED(hr))
+    return RuntimeFailure("allocate texture sample", hr);
+  Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+  Microsoft::WRL::ComPtr<IMFDXGIBuffer> dxgi_buffer;
+  hr = (*sample)->GetBufferByIndex(0, buffer.GetAddressOf());
+  if (SUCCEEDED(hr))
+    hr = buffer.As(&dxgi_buffer);
+  if (SUCCEEDED(hr))
+    hr = dxgi_buffer->GetResource(IID_PPV_ARGS(texture->ReleaseAndGetAddressOf()));
+  if (SUCCEEDED(hr))
+    hr = dxgi_buffer->GetSubresourceIndex(subresource);
+  if (FAILED(hr))
+    return RuntimeFailure("texture sample buffer", hr);
+  // Some MFTs read the current length even of a GPU buffer.
+  Microsoft::WRL::ComPtr<IMF2DBuffer> buffer_2d;
+  DWORD length = 0;
+  if (SUCCEEDED(buffer.As(&buffer_2d)) &&
+      SUCCEEDED(buffer_2d->GetContiguousLength(&length)))
+    buffer->SetCurrentLength(length);
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+int32_t MftH264EncoderImpl::TextureSample(
+    const livekit_ffi::D3D11TextureBuffer& frame,
+    Microsoft::WRL::ComPtr<IMFSample>* sample) {
+  auto& d3d = *d3d_;
+  auto opened = std::find_if(d3d.opened.begin(), d3d.opened.end(),
+                             [&](const D3DInput::Opened& entry) {
+                               return entry.id == frame.texture_id();
+                             });
+  if (opened == d3d.opened.end()) {
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = d3d.device->OpenSharedResource(frame.shared_handle(),
+                                                IID_PPV_ARGS(&texture));
+    if (FAILED(hr))
+      return TextureInputFailed("open shared texture", hr);
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_NV12 || desc.Width != width_ ||
+        desc.Height != height_)
+      return TextureInputFailed("shared texture shape", E_INVALIDARG);
+    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> mutex;
+    hr = texture.As(&mutex);
+    if (FAILED(hr))
+      return TextureInputFailed("shared texture mutex", hr);
+    if (d3d.opened.size() >= kOpenedTextureCache)
+      d3d.opened.pop_front();
+    d3d.opened.push_back({frame.texture_id(), std::move(texture),
+                          std::move(mutex)});
+    opened = std::prev(d3d.opened.end());
+  }
+
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> target;
+  UINT subresource = 0;
+  const int32_t allocated = AllocateTextureSample(sample, &target, &subresource);
+  if (allocated != WEBRTC_VIDEO_CODEC_OK)
+    return allocated;
+
+  const HRESULT acquired = opened->mutex->AcquireSync(0, kTextureAcquireMs);
+  if (acquired == static_cast<HRESULT>(WAIT_TIMEOUT))
+    return kSkipFrame;
+  if (acquired != S_OK) {
+    // Abandoned (the producer's device went away) or a device error.
+    d3d.opened.erase(opened);
+    return TextureInputFailed("acquire shared texture", acquired);
+  }
+  d3d.context->CopySubresourceRegion(target.Get(), subresource, 0, 0, 0,
+                                     opened->texture.Get(), 0, nullptr);
+  opened->mutex->ReleaseSync(0);
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+int32_t MftH264EncoderImpl::UploadSample(
+    const NV12BufferInterface* nv12,
+    const I420BufferInterface* i420,
+    Microsoft::WRL::ComPtr<IMFSample>* sample) {
+  auto& d3d = *d3d_;
+  if (!d3d.upload) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width_;
+    desc.Height = height_;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    const HRESULT hr = d3d.device->CreateTexture2D(&desc, nullptr, &d3d.upload);
+    if (FAILED(hr))
+      return RuntimeFailure("create upload texture", hr);
+  }
+
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> target;
+  UINT subresource = 0;
+  const int32_t allocated = AllocateTextureSample(sample, &target, &subresource);
+  if (allocated != WEBRTC_VIDEO_CODEC_OK)
+    return allocated;
+
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  const HRESULT hr =
+      d3d.context->Map(d3d.upload.Get(), 0, D3D11_MAP_WRITE, 0, &mapped);
+  if (FAILED(hr))
+    return RuntimeFailure("map upload texture", hr);
+  // One allocation: the interleaved chroma plane follows `Height` luma rows
+  // at the same pitch, which is the layout I420ToNV12 writes.
+  auto* luma = static_cast<uint8_t*>(mapped.pData);
+  if (nv12) {
+    libyuv::CopyPlane(nv12->DataY(), nv12->StrideY(), luma, mapped.RowPitch,
+                      width_, height_);
+    libyuv::CopyPlane(nv12->DataUV(), nv12->StrideUV(),
+                      luma + static_cast<size_t>(mapped.RowPitch) * height_,
+                      mapped.RowPitch, width_, height_ / 2);
+  } else {
+    I420ToNV12(i420, luma, static_cast<int>(mapped.RowPitch));
+  }
+  d3d.context->Unmap(d3d.upload.Get(), 0);
+  d3d.context->CopySubresourceRegion(target.Get(), subresource, 0, 0, 0,
+                                     d3d.upload.Get(), 0, nullptr);
+  return WEBRTC_VIDEO_CODEC_OK;
 }
 
 int32_t MftH264EncoderImpl::FinishEncodeAttempt() {
@@ -738,14 +1164,32 @@ int32_t MftH264EncoderImpl::Encode(
   // Only allocate/copy pixels after the transform can accept them.
   const uint64_t copy_start = livekit::mft_now_us();
   auto* frame_buffer = input_frame.video_frame_buffer().get();
+  // A texture on our adapter is copied on the GPU. Anything else, including
+  // a texture still in flight after texture input was withdrawn, goes in as
+  // pixels: a texture buffer reads itself back.
+  const livekit_ffi::D3D11TextureBuffer* texture =
+      d3d_ && d3d_->texture_input
+          ? livekit_ffi::D3D11TextureBuffer::From(frame_buffer)
+          : nullptr;
+  if (texture && texture->adapter_luid() != d3d_->luid)
+    texture = nullptr;
   const NV12BufferInterface* nv12_buffer = nullptr;
   webrtc::scoped_refptr<I420BufferInterface> i420_buffer;
-  if (frame_buffer->type() == VideoFrameBuffer::Type::kNV12)
-    nv12_buffer = frame_buffer->GetNV12();
-  if (!nv12_buffer) {
-    i420_buffer = frame_buffer->ToI420();
-    if (!i420_buffer)
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+  if (!texture) {
+    if (frame_buffer->type() == VideoFrameBuffer::Type::kNV12)
+      nv12_buffer = frame_buffer->GetNV12();
+    if (!nv12_buffer) {
+      i420_buffer = frame_buffer->ToI420();
+      if (!i420_buffer) {
+        // A texture that could not be read back is one lost frame, not a
+        // broken encoder.
+        if (frame_buffer->type() == VideoFrameBuffer::Type::kNative) {
+          livekit::mft_timing().dropped.fetch_add(1, std::memory_order_relaxed);
+          return FinishEncodeAttempt();
+        }
+        return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      }
+    }
   }
 
   // The screen-share GOP is sized once at init (2 s at the init frame rate)
@@ -796,46 +1240,66 @@ int32_t MftH264EncoderImpl::Encode(
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
   }
 
-  // With the validated even dimensions this is the canonical contiguous NV12
-  // layout: a full-resolution Y plane followed by a half-height interleaved UV
-  // plane, both with width-byte stride.
-  const DWORD luma_size = width_ * height_;
-  const DWORD chroma_size = width_ * (height_ / 2);
-  const DWORD nv12_size = luma_size + chroma_size;
-  Microsoft::WRL::ComPtr<IMFMediaBuffer> input_buffer;
-  HRESULT hr = MFCreateMemoryBuffer(nv12_size, input_buffer.GetAddressOf());
-  if (FAILED(hr))
-    return RuntimeFailure("allocate input buffer", hr);
-
-  BYTE* buffer_data = nullptr;
-  hr = input_buffer->Lock(&buffer_data, nullptr, nullptr);
-  if (FAILED(hr))
-    return RuntimeFailure("lock input buffer", hr);
-
-  if (nv12_buffer) {
-    libyuv::CopyPlane(nv12_buffer->DataY(), nv12_buffer->StrideY(),
-                      buffer_data, width_, width_, height_);
-    libyuv::CopyPlane(nv12_buffer->DataUV(), nv12_buffer->StrideUV(),
-                      buffer_data + luma_size, width_, width_, height_ / 2);
-  } else {
-    I420ToNV12(i420_buffer.get(), buffer_data, width_);
-  }
-
-  hr = input_buffer->Unlock();
-  if (FAILED(hr))
-    return RuntimeFailure("unlock input buffer", hr);
-  hr = input_buffer->SetCurrentLength(nv12_size);
-  if (FAILED(hr))
-    return RuntimeFailure("set input buffer length", hr);
-
   Microsoft::WRL::ComPtr<IMFSample> input_sample;
-  hr = MFCreateSample(input_sample.GetAddressOf());
-  if (FAILED(hr))
-    return RuntimeFailure("create input sample", hr);
+  HRESULT hr = S_OK;
+  if (d3d_) {
+    const int32_t result =
+        texture ? TextureSample(*texture, &input_sample)
+                : UploadSample(nv12_buffer, i420_buffer.get(), &input_sample);
+    if (result == kSkipFrame) {
+      livekit::mft_timing().dropped.fetch_add(1, std::memory_order_relaxed);
+      return FinishEncodeAttempt();
+    }
+    if (result != WEBRTC_VIDEO_CODEC_OK)
+      return result;
+    if (texture) {
+      livekit::mft_timing().texture_frames.fetch_add(1, std::memory_order_relaxed);
+      livekit::mft_diag_flag(2048);
+    } else {
+      livekit::mft_timing().memory_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+  } else {
+    // With the validated even dimensions this is the canonical contiguous
+    // NV12 layout: a full-resolution Y plane followed by a half-height
+    // interleaved UV plane, both with width-byte stride.
+    const DWORD luma_size = width_ * height_;
+    const DWORD chroma_size = width_ * (height_ / 2);
+    const DWORD nv12_size = luma_size + chroma_size;
+    Microsoft::WRL::ComPtr<IMFMediaBuffer> input_buffer;
+    hr = MFCreateMemoryBuffer(nv12_size, input_buffer.GetAddressOf());
+    if (FAILED(hr))
+      return RuntimeFailure("allocate input buffer", hr);
 
-  hr = input_sample->AddBuffer(input_buffer.Get());
-  if (FAILED(hr))
-    return RuntimeFailure("attach input buffer", hr);
+    BYTE* buffer_data = nullptr;
+    hr = input_buffer->Lock(&buffer_data, nullptr, nullptr);
+    if (FAILED(hr))
+      return RuntimeFailure("lock input buffer", hr);
+
+    if (nv12_buffer) {
+      libyuv::CopyPlane(nv12_buffer->DataY(), nv12_buffer->StrideY(),
+                        buffer_data, width_, width_, height_);
+      libyuv::CopyPlane(nv12_buffer->DataUV(), nv12_buffer->StrideUV(),
+                        buffer_data + luma_size, width_, width_, height_ / 2);
+    } else {
+      I420ToNV12(i420_buffer.get(), buffer_data, width_);
+    }
+
+    hr = input_buffer->Unlock();
+    if (FAILED(hr))
+      return RuntimeFailure("unlock input buffer", hr);
+    hr = input_buffer->SetCurrentLength(nv12_size);
+    if (FAILED(hr))
+      return RuntimeFailure("set input buffer length", hr);
+
+    hr = MFCreateSample(input_sample.GetAddressOf());
+    if (FAILED(hr))
+      return RuntimeFailure("create input sample", hr);
+
+    hr = input_sample->AddBuffer(input_buffer.Get());
+    if (FAILED(hr))
+      return RuntimeFailure("attach input buffer", hr);
+    livekit::mft_timing().memory_frames.fetch_add(1, std::memory_order_relaxed);
+  }
   // MF sample time is in 100-ns units. rtp_timestamp() is a 90kHz RTP tick
   // count, not 100-ns, so feeding it here fed QSV/AMF rate control a bogus
   // timeline. timestamp_us() * 10 converts microseconds to 100-ns units, which
@@ -1208,7 +1672,10 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
 
 VideoEncoder::EncoderInfo MftH264EncoderImpl::GetEncoderInfo() const {
   EncoderInfo info;
-  info.supports_native_handle = false;
+  // Texture frames pass straight through only while texture input is on;
+  // otherwise WebRTC maps them to the preferred formats below first.
+  info.supports_native_handle =
+      texture_input_on_.load(std::memory_order_relaxed);
   info.implementation_name = encoder_name_;
   info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
   info.is_hardware_accelerated = true;

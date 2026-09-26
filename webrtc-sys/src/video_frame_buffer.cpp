@@ -18,6 +18,10 @@
 
 #include "api/make_ref_counted.h"
 
+#ifdef _WIN32
+#include "livekit/d3d11_texture_buffer.h"
+#endif
+
 namespace livekit_ffi {
 
 VideoFrameBuffer::VideoFrameBuffer(
@@ -341,6 +345,31 @@ std::unique_ptr<NV12Buffer> new_nv12_buffer(int width,
                                             int stride_uv) {
   return std::make_unique<NV12Buffer>(
       webrtc::NV12Buffer::Create(width, height, stride_y, stride_uv));
+}
+
+std::unique_ptr<VideoFrameBuffer> new_d3d11_texture_buffer(
+    uint8_t* texture,
+    size_t shared_handle,
+    uint64_t texture_id,
+    uint64_t adapter_luid,
+    int width,
+    int height) {
+#ifdef _WIN32
+  // NV12 needs even dimensions; the producer's texture could not exist
+  // otherwise, so an odd size here is a caller bug, not a frame to encode.
+  if (!texture || shared_handle == 0 || adapter_luid == 0 || width <= 0 ||
+      height <= 0 || (width & 1) || (height & 1))
+    return nullptr;
+  // The ComPtr takes its own reference; the caller keeps its own.
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> owned(
+      reinterpret_cast<ID3D11Texture2D*>(texture));
+  return std::make_unique<VideoFrameBuffer>(
+      webrtc::make_ref_counted<D3D11TextureBuffer>(
+          std::move(owned), reinterpret_cast<HANDLE>(shared_handle),
+          texture_id, adapter_luid, width, height));
+#else
+  return nullptr;
+#endif
 }
 
 #ifndef __APPLE__

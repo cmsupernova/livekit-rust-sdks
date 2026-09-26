@@ -130,6 +130,11 @@ void screen_set_encoder_mode(uint32_t mode);
 // Reads (does not drain) the MFT diagnostic state: stage/hr of the last MFT
 // encoder attempt plus factory registration flags. See nvenc_timing.h.
 livekit_ffi::MftDiag mft_diag_read();
+
+// Texture input offer (adapter LUID, 0 withdraws) and the adapter a live
+// encoder currently takes texture frames on. See nvenc_timing.h.
+void screen_set_d3d_input_adapter(uint64_t luid);
+uint64_t screen_d3d_input_adapter();
 livekit_ffi::MftTiming mft_timing_take();
 
 }  // namespace livekit_ffi
