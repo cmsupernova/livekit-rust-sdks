@@ -2,6 +2,8 @@
 
 #ifdef _WIN32
 
+#include <cstdio>
+
 #include "api/make_ref_counted.h"
 #include "api/video/nv12_buffer.h"
 #include "rtc_base/logging.h"
@@ -11,6 +13,14 @@ namespace livekit_ffi {
 namespace {
 
 constexpr char kStorage[] = "d3d11-nv12-keyed-mutex";
+
+// RTC_LOG formats each argument on its own, so std::hex never reaches the
+// value after it.
+std::string Hex(HRESULT hr) {
+  char text[16];
+  std::snprintf(text, sizeof(text), "0x%08lX", static_cast<unsigned long>(hr));
+  return text;
+}
 
 // Read-backs serve fallback paths only, so waiting out a producer that is
 // mid-render beats returning no picture at all.
@@ -39,6 +49,10 @@ ReadbackDevice& Readback() {
 }
 
 bool EnsureReadbackDevice(ReadbackDevice& rb, uint64_t luid) {
+  // A removed device (driver reset, TDR) keeps its LUID but fails every
+  // call from then on; start over with a fresh one.
+  if (rb.device && FAILED(rb.device->GetDeviceRemovedReason()))
+    rb = ReadbackDevice{};
   if (rb.device && rb.luid == luid)
     return true;
   rb = ReadbackDevice{};
@@ -80,6 +94,38 @@ Microsoft::WRL::ComPtr<IDXGIAdapter1> FindAdapterByLuid(uint64_t luid) {
         LuidValue(desc.AdapterLuid) == luid)
       return adapter;
   }
+}
+
+webrtc::scoped_refptr<D3D11TextureBuffer> D3D11TextureBuffer::Create(
+    ID3D11Texture2D* texture,
+    HANDLE expected_handle,
+    uint64_t texture_id,
+    uint64_t adapter_luid,
+    int width,
+    int height) {
+  if (!texture || adapter_luid == 0 || width <= 0 || height <= 0 ||
+      (width & 1) || (height & 1))
+    return nullptr;
+  // Consumers copy subresource 0 whole and map it as one NV12 plane pair.
+  D3D11_TEXTURE2D_DESC desc{};
+  texture->GetDesc(&desc);
+  if (desc.Format != DXGI_FORMAT_NV12 ||
+      desc.Width != static_cast<UINT>(width) ||
+      desc.Height != static_cast<UINT>(height) || desc.MipLevels != 1 ||
+      desc.ArraySize != 1 || desc.SampleDesc.Count != 1 ||
+      !(desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX))
+    return nullptr;
+  // The handle must be this texture's: the buffer's reference keeps only
+  // this texture alive, and a stale legacy handle could name anything.
+  Microsoft::WRL::ComPtr<IDXGIResource> resource;
+  HANDLE handle = nullptr;
+  if (FAILED(texture->QueryInterface(IID_PPV_ARGS(&resource))) ||
+      FAILED(resource->GetSharedHandle(&handle)) || !handle ||
+      (expected_handle && expected_handle != handle))
+    return nullptr;
+  return webrtc::make_ref_counted<D3D11TextureBuffer>(
+      Microsoft::WRL::ComPtr<ID3D11Texture2D>(texture), handle, texture_id,
+      adapter_luid, width, height);
 }
 
 D3D11TextureBuffer::D3D11TextureBuffer(
@@ -128,6 +174,20 @@ D3D11TextureBuffer::ToI420() {
 }
 
 webrtc::scoped_refptr<webrtc::VideoFrameBuffer>
+D3D11TextureBuffer::CropAndScale(int offset_x,
+                                 int offset_y,
+                                 int crop_width,
+                                 int crop_height,
+                                 int scaled_width,
+                                 int scaled_height) {
+  auto buffer = ReadBack();
+  if (!buffer)
+    return nullptr;
+  return buffer->CropAndScale(offset_x, offset_y, crop_width, crop_height,
+                              scaled_width, scaled_height);
+}
+
+webrtc::scoped_refptr<webrtc::VideoFrameBuffer>
 D3D11TextureBuffer::GetMappedFrameBuffer(webrtc::ArrayView<Type> types) {
   for (Type type : types) {
     if (type == Type::kNV12)
@@ -155,8 +215,7 @@ webrtc::scoped_refptr<webrtc::VideoFrameBuffer> D3D11TextureBuffer::ReadBack() {
   HRESULT hr = rb.device->OpenSharedResource(shared_handle_,
                                              IID_PPV_ARGS(&texture));
   if (FAILED(hr)) {
-    RTC_LOG(LS_WARNING) << "D3D11 texture read-back: open failed 0x"
-                        << std::hex << hr;
+    RTC_LOG(LS_WARNING) << "D3D11 texture read-back: open failed " << Hex(hr);
     return nullptr;
   }
   D3D11_TEXTURE2D_DESC source{};

@@ -33,6 +33,10 @@
 #include "rtc_base/time_utils.h"
 #include "webrtc-sys/src/video_track.rs.h"
 
+#ifdef _WIN32
+#include "livekit/d3d11_texture_buffer.h"
+#endif
+
 namespace livekit_ffi {
 
 VideoTrack::VideoTrack(std::shared_ptr<RtcRuntime> rtc_runtime,
@@ -154,9 +158,22 @@ bool VideoTrackSource::InternalSource::on_captured_frame(
     return false;
   }
 
-  if (adapted_width != frame.width() || adapted_height != frame.height()) {
+  // A GPU texture frame is never rescaled here: that would read every frame
+  // back to memory on this thread, the very cost texture input exists to
+  // avoid, and exactly while the encoder reports overuse. Its capturer sheds
+  // load at the source instead. Frame-rate adaptation above still applies.
+  bool rescale =
+      adapted_width != frame.width() || adapted_height != frame.height();
+#ifdef _WIN32
+  if (D3D11TextureBuffer::From(buffer.get()))
+    rescale = false;
+#endif
+  if (rescale) {
     buffer = buffer->CropAndScale(crop_x, crop_y, crop_width, crop_height,
                                   adapted_width, adapted_height);
+    // A native buffer can fail to convert; drop the frame.
+    if (!buffer)
+      return false;
   }
 
   webrtc::VideoRotation rotation = frame.rotation();
@@ -164,6 +181,8 @@ bool VideoTrackSource::InternalSource::on_captured_frame(
     // If the buffer is I420, webrtc::AdaptedVideoTrackSource will handle the
     // rotation for us.
     buffer = buffer->ToI420();
+    if (!buffer)
+      return false;
   }
 
   OnFrame(webrtc::VideoFrame::Builder()

@@ -495,18 +495,23 @@ pub mod native {
 
         /// Wraps an NV12 D3D11 texture shared with a keyed mutex as a frame.
         ///
-        /// The texture must be created with `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`
+        /// The texture must be a single-subresource NV12 texture of exactly
+        /// `width` x `height` created with `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`,
         /// and rendered under key 0 (acquire 0, render, release 0); consumers
         /// copy it under the same key. A texture-input encoder on the same
         /// adapter reads it on the GPU (see `native::screen_d3d_input_adapter`);
-        /// anything else reads it back to memory once. The buffer holds its own
-        /// COM reference, so the allocation outlives the producer's ring while
-        /// frames are in flight. `texture_id` must be unique per texture for the
-        /// life of the process. Returns `None` for invalid arguments (odd
-        /// dimensions included).
+        /// anything else reads it back to memory once. Consumers copy whatever
+        /// the texture holds when they copy, so re-rendering it while a frame
+        /// that references it is still in flight shows the newer picture. The
+        /// buffer holds its own COM reference, so the allocation outlives the
+        /// producer's ring while frames are in flight; the final release can run
+        /// on a WebRTC thread, so the producer's device must not be created with
+        /// `D3D11_CREATE_DEVICE_SINGLETHREADED`. `texture_id` must be unique per
+        /// texture for the life of the process. Returns `None` when the texture
+        /// does not fit that description, when `shared_handle` (if non-zero) is
+        /// not its legacy shared handle, or for odd dimensions.
         ///
-        /// Safety: `texture` must be a live `ID3D11Texture2D*` and
-        /// `shared_handle` its `IDXGIResource::GetSharedHandle`.
+        /// Safety: `texture` must be a live `ID3D11Texture2D*`.
         #[cfg(target_os = "windows")]
         pub unsafe fn from_d3d11_texture(
             texture: *mut std::ffi::c_void,

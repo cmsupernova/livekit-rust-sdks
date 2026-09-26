@@ -41,7 +41,16 @@ unsigned int VideoFrameBuffer::height() const {
 }
 
 std::unique_ptr<I420Buffer> VideoFrameBuffer::to_i420() const {
-  return std::make_unique<I420Buffer>(buffer_->ToI420());
+  auto i420 = buffer_->ToI420();
+  if (!i420) {
+    // A native buffer that could not be converted (a D3D11 texture whose
+    // read-back failed, say). Rust would dereference a null buffer; give it
+    // a black picture of the right size instead.
+    auto black = webrtc::I420Buffer::Create(buffer_->width(), buffer_->height());
+    webrtc::I420Buffer::SetBlack(black.get());
+    i420 = black;
+  }
+  return std::make_unique<I420Buffer>(i420);
 }
 
 // const_cast is valid here because we take the ownership on the rust side
@@ -355,18 +364,15 @@ std::unique_ptr<VideoFrameBuffer> new_d3d11_texture_buffer(
     int width,
     int height) {
 #ifdef _WIN32
-  // NV12 needs even dimensions; the producer's texture could not exist
-  // otherwise, so an odd size here is a caller bug, not a frame to encode.
-  if (!texture || shared_handle == 0 || adapter_luid == 0 || width <= 0 ||
-      height <= 0 || (width & 1) || (height & 1))
+  // Create() validates the texture and its handle and takes its own
+  // reference; the caller keeps its own.
+  auto buffer = D3D11TextureBuffer::Create(
+      reinterpret_cast<ID3D11Texture2D*>(texture),
+      reinterpret_cast<HANDLE>(shared_handle), texture_id, adapter_luid,
+      width, height);
+  if (!buffer)
     return nullptr;
-  // The ComPtr takes its own reference; the caller keeps its own.
-  Microsoft::WRL::ComPtr<ID3D11Texture2D> owned(
-      reinterpret_cast<ID3D11Texture2D*>(texture));
-  return std::make_unique<VideoFrameBuffer>(
-      webrtc::make_ref_counted<D3D11TextureBuffer>(
-          std::move(owned), reinterpret_cast<HANDLE>(shared_handle),
-          texture_id, adapter_luid, width, height));
+  return std::make_unique<VideoFrameBuffer>(buffer);
 #else
   return nullptr;
 #endif

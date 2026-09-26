@@ -120,6 +120,26 @@ constexpr DWORD kTextureAcquireMs = 10;
 // Encode-internal: drop this frame and carry on. Never returned to WebRTC.
 constexpr int32_t kSkipFrame = 2;
 
+// MFTEnum2 arrived in Windows 10 1703. It is looked up at run time: as a
+// load-time import it would stop the whole app from starting on older builds.
+using MftEnum2Fn = HRESULT(WINAPI*)(GUID,
+                                    UINT32,
+                                    const MFT_REGISTER_TYPE_INFO*,
+                                    const MFT_REGISTER_TYPE_INFO*,
+                                    IMFAttributes*,
+                                    IMFActivate***,
+                                    UINT32*);
+
+MftEnum2Fn ResolveMftEnum2() {
+  static const MftEnum2Fn fn = [] {
+    const HMODULE mfplat = GetModuleHandleW(L"mfplat.dll");
+    return mfplat ? reinterpret_cast<MftEnum2Fn>(
+                        GetProcAddress(mfplat, "MFTEnum2"))
+                  : nullptr;
+  }();
+  return fn;
+}
+
 }  // namespace
 
 struct MftH264EncoderImpl::D3DInput {
@@ -146,7 +166,8 @@ struct MftH264EncoderImpl::D3DInput {
   std::deque<Opened> opened;
 };
 
-MftH264EncoderImpl::MftH264EncoderImpl(const Environment& env) : env_(env) {}
+MftH264EncoderImpl::MftH264EncoderImpl(const Environment& env)
+    : env_(env), instance_id_(livekit::d3d_input_next_owner()) {}
 
 MftH264EncoderImpl::~MftH264EncoderImpl() { Release(); }
 
@@ -189,15 +210,16 @@ bool MftH264EncoderImpl::CreateMftEncoder(UINT32 candidate_index,
     LUID luid{};
     luid.LowPart = static_cast<DWORD>(adapter_luid & 0xffffffffu);
     luid.HighPart = static_cast<LONG>(adapter_luid >> 32);
-    hr = MFCreateAttributes(filter.GetAddressOf(), 1);
+    const MftEnum2Fn mft_enum2 = ResolveMftEnum2();
+    hr = mft_enum2 ? MFCreateAttributes(filter.GetAddressOf(), 1) : E_NOTIMPL;
     if (SUCCEEDED(hr))
       hr = filter->SetBlob(MFT_ENUM_ADAPTER_LUID,
                            reinterpret_cast<const UINT8*>(&luid), sizeof(luid));
     if (SUCCEEDED(hr))
-      hr = MFTEnum2(MFT_CATEGORY_VIDEO_ENCODER,
-                    MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                    &input_type, &output_type, filter.Get(), &activates,
-                    &count);
+      hr = mft_enum2(MFT_CATEGORY_VIDEO_ENCODER,
+                     MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                     &input_type, &output_type, filter.Get(), &activates,
+                     &count);
     *candidate_count = count;
     if (FAILED(hr) || count == 0 || candidate_index >= count) {
       if (candidate_index == 0)
@@ -530,7 +552,9 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
   const uint64_t texture_adapter =
       livekit::d3d_input_requested().load(std::memory_order_relaxed);
   if (inst && inst->mode == VideoCodecMode::kScreensharing &&
-      texture_adapter != 0) {
+      texture_adapter != 0 && TextureInputAllowed(texture_adapter)) {
+    // This attempt's outcome, not a previous encoder's.
+    livekit::mft_d3d_stage(0, 0);
     UINT32 count = 1;
     for (UINT32 index = 0; index < count && index < 4; ++index) {
       const int32_t result =
@@ -542,13 +566,19 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
       const uint32_t failed_hr =
           livekit::mft_diag().hr.load(std::memory_order_relaxed);
       Release();
-      if (manager_accepted) {
-        RTC_LOG(LS_WARNING) << "MFT failed to initialize with texture input";
+      // Keep a specific decline (stages 1-8); anything else, including the
+      // MFT failing before texture setup even began, is stage 9.
+      if (manager_accepted ||
+          livekit::mft_diag().d3d_stage.load(std::memory_order_relaxed) == 0) {
+        RTC_LOG(LS_WARNING) << "MFT failed to initialize for texture input";
         livekit::mft_d3d_stage(9, failed_hr);
       }
     }
   }
+  return InitEncodeClassic(inst);
+}
 
+int32_t MftH264EncoderImpl::InitEncodeClassic(const VideoCodec* inst) {
   // Keep the OS-preferred hardware first. A second adapter is useful only
   // if it accepts this actual codec/resolution/rate-control configuration.
   // Startup only: no GPU hopping, no extra simultaneous encoders, and no
@@ -564,6 +594,30 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
     Release();
   }
   return result;
+}
+
+bool MftH264EncoderImpl::TextureInputAllowed(uint64_t luid) {
+  if (livekit::d3d_input_failed().load(std::memory_order_relaxed) == luid) {
+    // Failed at runtime earlier this session; keep reporting that, with the
+    // HRESULT it failed with.
+    livekit::mft_d3d_stage(
+        12, livekit::d3d_input_failed_hr().load(std::memory_order_relaxed));
+    return false;
+  }
+  // Checked before any MFT is activated, so an offer on another vendor costs
+  // nothing but this lookup.
+  auto adapter = livekit_ffi::FindAdapterByLuid(luid);
+  DXGI_ADAPTER_DESC1 desc{};
+  if (!adapter || FAILED(adapter->GetDesc1(&desc))) {
+    livekit::mft_d3d_stage(3, static_cast<uint32_t>(E_FAIL));
+    return false;
+  }
+  if (desc.VendorId != kAmdVendorId &&
+      !livekit::d3d_input_any_vendor().load(std::memory_order_relaxed)) {
+    livekit::mft_d3d_stage(3, desc.VendorId);
+    return false;
+  }
+  return true;
 }
 
 int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
@@ -655,6 +709,16 @@ int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
   SetRates(RateControlParameters(allocation, codec_.maxFramerate));
   livekit::mft_timing().event_driven.store(event_driven, std::memory_order_relaxed);
   livekit::mft_timing().last_output_us.store(0, std::memory_order_relaxed);
+  if (d3d_ && d3d_->texture_input) {
+    // Only now may the capturer send textures: the MFT holds our manager,
+    // negotiated its types with it, and is streaming. Published before the
+    // staff event pump starts, so a failure it reports can only withdraw it.
+    texture_input_on_.store(true, std::memory_order_relaxed);
+    livekit::d3d_input_publish(instance_id_, d3d_->luid);
+    livekit::mft_d3d_stage(10, 0);
+    livekit::mft_diag_flag(1024);
+    RTC_LOG(LS_INFO) << "MFT texture input on for this encoder";
+  }
   if (event_driven) {
     event_pump_ = Microsoft::WRL::Make<EventPump>(this, event_gen_.Get());
     if (!event_pump_) return WEBRTC_VIDEO_CODEC_MEMORY;
@@ -663,15 +727,6 @@ int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
       RuntimeFailure("start event pump", hr);
       return WEBRTC_VIDEO_CODEC_ERROR;
     }
-  }
-  if (d3d_ && d3d_->texture_input) {
-    // Only now may the capturer send textures: the MFT holds our manager,
-    // negotiated its types with it, and is streaming.
-    texture_input_on_.store(true, std::memory_order_relaxed);
-    livekit::d3d_input_active().store(d3d_->luid, std::memory_order_relaxed);
-    livekit::mft_d3d_stage(10, 0);
-    livekit::mft_diag_flag(1024);
-    RTC_LOG(LS_INFO) << "MFT texture input on for this encoder";
   }
   return WEBRTC_VIDEO_CODEC_OK;
 }
@@ -717,6 +772,7 @@ int32_t MftH264EncoderImpl::Release() {
   d3d_.reset();
   adapter_luid_ = 0;
   d3d_attempted_ = false;
+  retry_in_memory_.store(false, std::memory_order_relaxed);
   if (mf_started_) {
     MFShutdown();
     mf_started_ = false;
@@ -746,8 +802,14 @@ int32_t MftH264EncoderImpl::RuntimeFailure(const char* operation, HRESULT hr) {
     livekit::mft_diag_stage(14, static_cast<uint32_t>(hr));
   }
   runtime_failed_ = true;
-  // The software fallback takes over from here; stop the capturer sending
-  // textures now rather than after the adapter swaps encoders.
+  // In texture mode the failure may be texture input itself (an MFT that
+  // takes the D3D manager and then rejects or starves on texture samples).
+  // Encode brings the classic encoder up instead of handing the share to
+  // software; see RetryInMemory. Staff isolation arms keep failing closed.
+  if (d3d_ && livekit::screen_encoder_mode().load(std::memory_order_relaxed) == 0)
+    retry_in_memory_.store(true, std::memory_order_relaxed);
+  // Stop the capturer sending textures now rather than after the adapter
+  // swaps encoders.
   WithdrawTextureInput();
   // A generic ENCODER_FAILURE does not request WebRTC's runtime fallback.
   // Staff isolation still fails closed because it has no fallback factory.
@@ -881,19 +943,18 @@ bool MftH264EncoderImpl::EnableD3DInput() {
 
 void MftH264EncoderImpl::WithdrawTextureInput() {
   texture_input_on_.store(false, std::memory_order_relaxed);
+  // Only this encoder's claim; a newer encoder's stays.
+  livekit::d3d_input_withdraw(instance_id_);
   if (!d3d_)
     return;
   d3d_->texture_input = false;
   d3d_->opened.clear();
-  uint64_t ours = d3d_->luid;
-  livekit::d3d_input_active().compare_exchange_strong(
-      ours, 0, std::memory_order_relaxed);
 }
 
 int32_t MftH264EncoderImpl::TextureInputFailed(const char* operation,
                                                long hr) {
   RTC_LOG(LS_WARNING) << "MFT texture input " << operation << " failed: 0x"
-                      << std::hex << hr
+                      << std::hex << hr << std::dec
                       << "; taking frames from memory from here on";
   livekit::mft_d3d_stage(11, static_cast<uint32_t>(hr));
   WithdrawTextureInput();
@@ -1098,6 +1159,49 @@ int32_t MftH264EncoderImpl::DrainReadyOutput() {
 int32_t MftH264EncoderImpl::Encode(
     const VideoFrame& input_frame,
     const std::vector<VideoFrameType>* frame_types) {
+  const int32_t result = EncodeFrame(input_frame, frame_types);
+  if (result != WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE ||
+      !retry_in_memory_.load(std::memory_order_relaxed))
+    return result;
+  return RetryInMemory();
+}
+
+int32_t MftH264EncoderImpl::RetryInMemory() {
+  // Texture input failed at runtime. Before texture input existed this
+  // machine got the classic system-memory MFT, so give it exactly that back
+  // rather than software for the rest of the share, and do not try texture
+  // input on this adapter again until the app restarts. The failing frame is
+  // lost; the new transform starts with an IDR.
+  const uint64_t luid = d3d_ ? d3d_->luid : adapter_luid_;
+  const uint32_t failed_hr =
+      livekit::mft_diag().hr.load(std::memory_order_relaxed);
+  livekit::d3d_input_failed_hr().store(failed_hr, std::memory_order_relaxed);
+  livekit::d3d_input_failed().store(luid, std::memory_order_relaxed);
+  const VideoCodec codec = codec_;
+  const uint32_t target_bps = target_bps_;
+  const uint32_t framerate = max_framerate_;
+  const bool sending = sending_;
+  EncodedImageCallback* const callback = callback_;
+  Release();
+  if (InitEncodeClassic(&codec) != WEBRTC_VIDEO_CODEC_OK) {
+    Release();
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+  }
+  callback_ = callback;
+  if (sending && target_bps > 0) {
+    VideoBitrateAllocation allocation;
+    allocation.SetBitrate(0, 0, target_bps);
+    SetRates(RateControlParameters(allocation, static_cast<double>(framerate)));
+  }
+  livekit::mft_d3d_stage(12, failed_hr);
+  RTC_LOG(LS_WARNING) << "MFT texture input failed at runtime; the classic "
+                         "encoder took over";
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+int32_t MftH264EncoderImpl::EncodeFrame(
+    const VideoFrame& input_frame,
+    const std::vector<VideoFrameType>* frame_types) {
   const bool force_requested = frame_types && !frame_types->empty() &&
       (*frame_types)[0] == VideoFrameType::kVideoFrameKey;
   if (event_pump_ && force_requested)
@@ -1252,6 +1356,10 @@ int32_t MftH264EncoderImpl::Encode(
     }
     if (result != WEBRTC_VIDEO_CODEC_OK)
       return result;
+    // Tests only (never set in production): stand in for an MFT that takes
+    // the D3D manager and then fails on texture-mode samples.
+    if (livekit::d3d_input_fail_next().exchange(false, std::memory_order_relaxed))
+      return RuntimeFailure("simulated texture input failure", E_FAIL);
     if (texture) {
       livekit::mft_timing().texture_frames.fetch_add(1, std::memory_order_relaxed);
       livekit::mft_diag_flag(2048);

@@ -221,7 +221,8 @@ std::unique_ptr<NV12Buffer> new_nv12_buffer(int width, int height, int stride_y,
 
 // Windows: wraps a keyed-mutex-shared D3D11 NV12 texture (an
 // ID3D11Texture2D*, referenced, not adopted) as a native frame. Null on
-// other platforms or for invalid arguments. See d3d11_texture_buffer.h.
+// other platforms or when the texture or handle does not fit
+// (D3D11TextureBuffer::Create). See d3d11_texture_buffer.h.
 std::unique_ptr<VideoFrameBuffer> new_d3d11_texture_buffer(
     uint8_t* texture,
     size_t shared_handle,

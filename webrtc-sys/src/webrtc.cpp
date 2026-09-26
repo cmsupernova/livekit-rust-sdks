@@ -267,7 +267,7 @@ void screen_set_d3d_input_adapter(uint64_t luid) {
 }
 
 uint64_t screen_d3d_input_adapter() {
-  return livekit::d3d_input_active().load(std::memory_order_relaxed);
+  return livekit::d3d_input_active_luid();
 }
 
 void screen_set_encoder_mode(uint32_t mode) {
@@ -285,6 +285,9 @@ void screen_set_encoder_mode(uint32_t mode) {
   d.hr.store(0, std::memory_order_relaxed);
   d.flags.fetch_and(3u, std::memory_order_relaxed);
   livekit::mft_d3d_stage(0, 0);
+  // A previous share's encoder may still hold a claim while its connection
+  // closes; this share's capturer must wait for its own encoder.
+  livekit::d3d_input_reset();
   (void)mft_timing_take();
 }
 

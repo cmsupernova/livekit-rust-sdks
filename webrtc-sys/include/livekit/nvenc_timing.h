@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 
 // Aggregated NVENC timing counters.
 //
@@ -145,15 +146,19 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // 1024 texture input came on for the active MFT, 2048 a texture frame reached
 // it.
 //
-// D3D stages (texture input, see d3d_input_requested below): 0 not requested
-// or not a screen share, 1 no hardware H.264 MFT on the capturer's adapter,
-// 2 the MFT is not D3D11-aware, 3 adapter not found or not on the vendor
-// allowlist, 4 D3D11 device creation failed, 5 no extended resource sharing
-// or NV12 support, 6 DXGI device manager failed, 7 sample allocator failed,
-// 8 the MFT rejected the D3D manager, 9 the MFT failed to initialize with the
-// manager, 10 texture input on, 11 a texture copy or sample failed at runtime
-// and texture input turned off. Every stage but 10 and 11 means the classic
-// system-memory encoder was set up instead, exactly as before.
+// D3D stages (texture input, see d3d_input_requested below), with what the
+// d3d hr field holds: 0 not requested or not a screen share; 1 no hardware
+// H.264 MFT on the capturer's adapter, or MFTEnum2 missing (hr: the
+// enumeration's HRESULT); 2 the MFT is not D3D11-aware; 3 adapter not found
+// or not on the vendor allowlist (hr: the adapter's PCI vendor id); 4 D3D11
+// device creation failed; 5 no extended resource sharing or NV12 support;
+// 6 DXGI device manager failed; 7 sample allocator failed; 8 the MFT rejected
+// the D3D manager; 9 the MFT failed to initialize on the texture attempt;
+// 10 texture input on; 11 a texture copy or sample failed at runtime, frames
+// go in as uploads; 12 texture input failed at runtime and the classic
+// encoder took over, not retried on this adapter until the app restarts.
+// Stages 1-9 and 12 mean the classic system-memory encoder is running,
+// exactly as before texture input existed.
 struct MftDiagCounters {
   std::atomic<uint32_t> stage{0};
   std::atomic<uint32_t> hr{0};
@@ -193,9 +198,68 @@ inline std::atomic<uint64_t>& d3d_input_requested() {
   return luid;
 }
 
-inline std::atomic<uint64_t>& d3d_input_active() {
+// Which encoder takes texture frames now, and on which adapter. One lock,
+// not two atomics: an encoder released late (its PeerConnection closing
+// after the next share started) must not clear a newer encoder's claim.
+struct D3DInputClaim {
+  std::mutex mutex;
+  uint64_t owner = 0;
+  uint64_t luid = 0;
+};
+
+inline D3DInputClaim& d3d_input_claim() {
+  static D3DInputClaim claim;
+  return claim;
+}
+
+inline uint64_t d3d_input_next_owner() {
+  static std::atomic<uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void d3d_input_publish(uint64_t owner, uint64_t luid) {
+  auto& claim = d3d_input_claim();
+  std::lock_guard<std::mutex> lock(claim.mutex);
+  claim.owner = owner;
+  claim.luid = luid;
+}
+
+inline void d3d_input_withdraw(uint64_t owner) {
+  auto& claim = d3d_input_claim();
+  std::lock_guard<std::mutex> lock(claim.mutex);
+  if (claim.owner == owner) {
+    claim.owner = 0;
+    claim.luid = 0;
+  }
+}
+
+// Share start: no encoder of the new share has claimed anything yet.
+inline void d3d_input_reset() {
+  auto& claim = d3d_input_claim();
+  std::lock_guard<std::mutex> lock(claim.mutex);
+  claim.owner = 0;
+  claim.luid = 0;
+}
+
+inline uint64_t d3d_input_active_luid() {
+  auto& claim = d3d_input_claim();
+  std::lock_guard<std::mutex> lock(claim.mutex);
+  return claim.luid;
+}
+
+// The adapter whose MFT failed with texture input at runtime. Texture input
+// is not tried there again until the app restarts: a driver that takes the
+// D3D manager and then rejects or starves on texture samples would otherwise
+// cost every later share a failed start.
+inline std::atomic<uint64_t>& d3d_input_failed() {
   static std::atomic<uint64_t> luid{0};
   return luid;
+}
+
+// What that failure reported, so later shares' stage 12 carries it too.
+inline std::atomic<uint32_t>& d3d_input_failed_hr() {
+  static std::atomic<uint32_t> hr{0};
+  return hr;
 }
 
 // Texture input is on an allowlist of adapter vendors (AMD). Tests flip this
@@ -203,6 +267,13 @@ inline std::atomic<uint64_t>& d3d_input_active() {
 inline std::atomic<bool>& d3d_input_any_vendor() {
   static std::atomic<bool> any{false};
   return any;
+}
+
+// Tests only: fail the next texture-mode submission, to exercise the
+// classic-encoder takeover on hardware whose MFT never fails by itself.
+inline std::atomic<bool>& d3d_input_fail_next() {
+  static std::atomic<bool> fail{false};
+  return fail;
 }
 
 inline std::atomic<uint32_t>& screen_encoder_mode() {

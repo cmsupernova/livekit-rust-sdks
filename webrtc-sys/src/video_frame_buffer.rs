@@ -152,10 +152,10 @@ pub mod ffi {
 
         /// # SAFETY
         /// Windows only (null elsewhere). `texture` must be a live
-        /// `ID3D11Texture2D*` for an NV12 texture created with
-        /// `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`, and `shared_handle` its
-        /// `IDXGIResource::GetSharedHandle`. The buffer takes its own COM
-        /// reference. Returns null for invalid arguments.
+        /// `ID3D11Texture2D*`. It must be a single-subresource NV12 texture of
+        /// `width` x `height` created with `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`;
+        /// a non-zero `shared_handle` must be its `IDXGIResource::GetSharedHandle`.
+        /// Anything else returns null. The buffer takes its own COM reference.
         unsafe fn new_d3d11_texture_buffer(
             texture: *mut u8,
             shared_handle: usize,

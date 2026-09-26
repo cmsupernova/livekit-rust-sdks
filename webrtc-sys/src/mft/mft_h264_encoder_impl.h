@@ -90,6 +90,17 @@ class MftH264EncoderImpl : public VideoEncoder {
   // Published copy of "texture frames are copied in" for GetEncoderInfo,
   // which must not race the event pump withdrawing texture input.
   std::atomic<bool> texture_input_on_{false};
+  // This encoder's claim token for livekit::d3d_input_publish/withdraw.
+  uint64_t instance_id_ = 0;
+  // A runtime failure hit while in texture mode: Encode brings this encoder
+  // back up the classic way instead of handing the share to software.
+  std::atomic<bool> retry_in_memory_{false};
+  int32_t EncodeFrame(const VideoFrame& input_frame,
+                      const std::vector<VideoFrameType>* frame_types);
+  int32_t RetryInMemory();
+  int32_t InitEncodeClassic(const VideoCodec* inst);
+  // The offered adapter is allowed (AMD, not failed earlier this session).
+  bool TextureInputAllowed(uint64_t luid);
   bool EnableD3DInput();
   int32_t AllocateTextureSample(Microsoft::WRL::ComPtr<IMFSample>* sample,
                                 Microsoft::WRL::ComPtr<ID3D11Texture2D>* texture,

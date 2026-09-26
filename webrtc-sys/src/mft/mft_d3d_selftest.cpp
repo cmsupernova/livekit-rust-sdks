@@ -205,26 +205,51 @@ MftD3dSelfTest mft_d3d_selftest(uint32_t adapter_ordinal,
     timing.texture_frames.store(0);
     timing.memory_frames.store(0);
     timing.dropped.store(0);
+    livekit::d3d_input_failed().store(0);
+    livekit::d3d_input_reset();
     livekit::d3d_input_any_vendor().store(true);
     livekit::d3d_input_requested().store(r.adapter_luid);
+    auto& diag = livekit::mft_diag();
+    webrtc::VideoCodec codec;
+    codec.codecType = webrtc::kVideoCodecH264;
+    codec.width = static_cast<uint16_t>(width);
+    codec.height = static_cast<uint16_t>(height);
+    codec.maxFramerate = 30;
+    codec.startBitrate = 2000;
+    codec.minBitrate = 300;
+    codec.maxBitrate = 4000;
+    codec.mode = webrtc::VideoCodecMode::kScreensharing;
+    codec.numberOfSimulcastStreams = 0;
+    const webrtc::VideoEncoder::Settings settings(
+        webrtc::VideoEncoder::Capabilities(false), 1, 1200);
+    int64_t next_ts = 1000000;
+    auto encode = [&](webrtc::MftH264EncoderImpl& encoder, bool texture,
+                      bool key) {
+      webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
+      if (texture)
+        buffer = D3D11TextureBuffer::Create(shared.Get(), handle,
+                                            /*texture_id=*/1, r.adapter_luid,
+                                            w, h);
+      else
+        buffer = cpu;
+      const auto frame = webrtc::VideoFrame::Builder()
+                             .set_video_frame_buffer(buffer)
+                             .set_timestamp_us(next_ts)
+                             .set_rtp_timestamp(static_cast<uint32_t>(next_ts * 9 / 100))
+                             .build();
+      next_ts += 33333;
+      std::vector<webrtc::VideoFrameType> types{
+          key ? webrtc::VideoFrameType::kVideoFrameKey
+              : webrtc::VideoFrameType::kVideoFrameDelta};
+      const int32_t result = encoder.Encode(frame, &types);
+      std::this_thread::sleep_for(std::chrono::milliseconds(33));
+      return result;
+    };
     {
       webrtc::MftH264EncoderImpl encoder(webrtc::CreateEnvironment());
       CountingCallback callback;
       encoder.RegisterEncodeCompleteCallback(&callback);
-      webrtc::VideoCodec codec;
-      codec.codecType = webrtc::kVideoCodecH264;
-      codec.width = static_cast<uint16_t>(width);
-      codec.height = static_cast<uint16_t>(height);
-      codec.maxFramerate = 30;
-      codec.startBitrate = 2000;
-      codec.minBitrate = 300;
-      codec.maxBitrate = 4000;
-      codec.mode = webrtc::VideoCodecMode::kScreensharing;
-      codec.numberOfSimulcastStreams = 0;
-      const webrtc::VideoEncoder::Settings settings(
-          webrtc::VideoEncoder::Capabilities(false), 1, 1200);
       r.init_result = encoder.InitEncode(&codec, settings);
-      auto& diag = livekit::mft_diag();
       r.d3d_stage = diag.d3d_stage.load();
       r.d3d_hr = diag.d3d_hr.load();
       r.mft_stage = diag.stage.load();
@@ -232,31 +257,14 @@ MftD3dSelfTest mft_d3d_selftest(uint32_t adapter_ordinal,
       const auto info = encoder.GetEncoderInfo();
       r.native_handle = info.supports_native_handle;
       r.encoder_name = info.implementation_name;
-      r.active_luid = livekit::d3d_input_active().load();
+      r.active_luid = livekit::d3d_input_active_luid();
 
       if (r.init_result == WEBRTC_VIDEO_CODEC_OK) {
         const uint32_t total = cpu_frames + texture_frames;
         for (uint32_t i = 0; i < total; ++i) {
-          webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
-          if (i < cpu_frames) {
-            buffer = cpu;
-          } else {
-            buffer = webrtc::make_ref_counted<D3D11TextureBuffer>(
-                shared, handle, /*texture_id=*/1, r.adapter_luid, w, h);
-          }
-          const int64_t ts = 1000000 + static_cast<int64_t>(i) * 33333;
-          const auto frame = webrtc::VideoFrame::Builder()
-                                 .set_video_frame_buffer(buffer)
-                                 .set_timestamp_us(ts)
-                                 .set_rtp_timestamp(static_cast<uint32_t>(ts * 9 / 100))
-                                 .build();
-          std::vector<webrtc::VideoFrameType> types{
-              i == 0 ? webrtc::VideoFrameType::kVideoFrameKey
-                     : webrtc::VideoFrameType::kVideoFrameDelta};
-          const int32_t result = encoder.Encode(frame, &types);
+          const int32_t result = encode(encoder, i >= cpu_frames, i == 0);
           if (result != WEBRTC_VIDEO_CODEC_OK && r.first_error == 0)
             r.first_error = result;
-          std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
       }
       r.flags = diag.flags.load();
@@ -265,16 +273,81 @@ MftD3dSelfTest mft_d3d_selftest(uint32_t adapter_ordinal,
       r.dropped = timing.dropped.exchange(0);
       r.encoded_frames = callback.frames.load();
       r.key_frames = callback.keys.load();
+
+      // The safety net: a runtime failure in texture mode brings the same
+      // encoder back up the classic way instead of handing it to software.
+      if (r.init_result == WEBRTC_VIDEO_CODEC_OK) {
+        livekit::d3d_input_fail_next().store(true);
+        const uint32_t before = callback.frames.load();
+        for (uint32_t i = 0; i < 20; ++i) {
+          const int32_t result = encode(encoder, /*texture=*/true, false);
+          if (result != WEBRTC_VIDEO_CODEC_OK && r.fallback_error == 0)
+            r.fallback_error = result;
+        }
+        r.fallback_stage = diag.d3d_stage.load();
+        r.fallback_hr = diag.d3d_hr.load();
+        r.fallback_native_handle = encoder.GetEncoderInfo().supports_native_handle;
+        r.fallback_active_luid = livekit::d3d_input_active_luid();
+        r.fallback_encoded = callback.frames.load() - before;
+        r.fallback_memory_frames = timing.memory_frames.exchange(0);
+        r.fallback_latched = livekit::d3d_input_failed().load() == r.adapter_luid;
+      }
       encoder.Release();
-      r.active_after_release = livekit::d3d_input_active().load();
+      r.active_after_release = livekit::d3d_input_active_luid();
     }
+    if (r.init_result == WEBRTC_VIDEO_CODEC_OK) {
+      // A later encoder in the same session does not try texture input on
+      // the adapter that failed.
+      webrtc::MftH264EncoderImpl encoder(webrtc::CreateEnvironment());
+      CountingCallback callback;
+      encoder.RegisterEncodeCompleteCallback(&callback);
+      r.latched_init = encoder.InitEncode(&codec, settings);
+      r.latched_native_handle = encoder.GetEncoderInfo().supports_native_handle;
+      r.latched_stage = diag.d3d_stage.load();
+      r.latched_hr = diag.d3d_hr.load();
+      encoder.Release();
+    }
+    livekit::d3d_input_fail_next().store(false);
+    livekit::d3d_input_failed().store(0);
+    livekit::d3d_input_failed_hr().store(0);
     livekit::d3d_input_requested().store(0);
     livekit::d3d_input_any_vendor().store(false);
 
     // Everything that needs pixels goes through this read-back.
-    auto readback = webrtc::make_ref_counted<D3D11TextureBuffer>(
-        shared, handle, /*texture_id=*/2, r.adapter_luid, w, h);
-    r.readback_ok = ReadbackMatches(readback->ToI420(), w, h);
+    auto readback = D3D11TextureBuffer::Create(shared.Get(), handle,
+                                               /*texture_id=*/2,
+                                               r.adapter_luid, w, h);
+    r.readback_ok = readback && ReadbackMatches(readback->ToI420(), w, h);
+    // Rescaling reads back once and scales the NV12 instead of crashing
+    // through the default path.
+    auto half = readback ? readback->CropAndScale(0, 0, w, h, w / 2, h / 2)
+                         : nullptr;
+    r.crop_ok = half && half->type() == webrtc::VideoFrameBuffer::Type::kNV12 &&
+                half->width() == w / 2 && half->height() == h / 2;
+
+    // Create() refuses anything consumers could not copy as one NV12
+    // subresource, and a handle that is not the texture's own.
+    D3D11_TEXTURE2D_DESC plain_desc{};
+    shared->GetDesc(&plain_desc);
+    plain_desc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> plain;
+    D3D11_TEXTURE2D_DESC other_desc{};
+    shared->GetDesc(&other_desc);
+    ComPtr<ID3D11Texture2D> other;
+    HANDLE other_handle = nullptr;
+    ComPtr<IDXGIResource> other_resource;
+    const bool made =
+        SUCCEEDED(device->CreateTexture2D(&plain_desc, nullptr, &plain)) &&
+        SUCCEEDED(device->CreateTexture2D(&other_desc, nullptr, &other)) &&
+        SUCCEEDED(other.As(&other_resource)) &&
+        SUCCEEDED(other_resource->GetSharedHandle(&other_handle));
+    r.validation_ok =
+        made &&
+        D3D11TextureBuffer::Create(shared.Get(), nullptr, 3, r.adapter_luid, w, h) &&
+        !D3D11TextureBuffer::Create(shared.Get(), other_handle, 4, r.adapter_luid, w, h) &&
+        !D3D11TextureBuffer::Create(plain.Get(), nullptr, 5, r.adapter_luid, w, h) &&
+        !D3D11TextureBuffer::Create(shared.Get(), handle, 6, r.adapter_luid, w + 2, h) &&
+        !D3D11TextureBuffer::Create(shared.Get(), handle, 7, 0, w, h);
   }
 
   MFShutdown();

@@ -25,6 +25,19 @@ namespace livekit_ffi {
 // software fallback and rescaling keep working.
 class D3D11TextureBuffer : public webrtc::VideoFrameBuffer {
  public:
+  // Checks the texture really is what consumers assume (a single-subresource
+  // NV12 texture of this size shared with a keyed mutex) and takes the shared
+  // handle from the texture itself; a non-null `expected_handle` must match
+  // it. Null if anything does not fit.
+  static webrtc::scoped_refptr<D3D11TextureBuffer> Create(
+      ID3D11Texture2D* texture,
+      HANDLE expected_handle,
+      uint64_t texture_id,
+      uint64_t adapter_luid,
+      int width,
+      int height);
+
+  // Use Create(); public only for make_ref_counted.
   D3D11TextureBuffer(Microsoft::WRL::ComPtr<ID3D11Texture2D> texture,
                      HANDLE shared_handle,
                      uint64_t texture_id,
@@ -41,6 +54,16 @@ class D3D11TextureBuffer : public webrtc::VideoFrameBuffer {
   webrtc::scoped_refptr<webrtc::I420BufferInterface> ToI420() override;
   webrtc::scoped_refptr<webrtc::VideoFrameBuffer> GetMappedFrameBuffer(
       webrtc::ArrayView<Type> types) override;
+  // The default goes through ToI420() and dereferences it unchecked, which
+  // crashes when the read-back fails. This reads back once, scales the NV12,
+  // and returns null on failure.
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> CropAndScale(
+      int offset_x,
+      int offset_y,
+      int crop_width,
+      int crop_height,
+      int scaled_width,
+      int scaled_height) override;
   std::string storage_representation() const override;
 
   HANDLE shared_handle() const { return shared_handle_; }
