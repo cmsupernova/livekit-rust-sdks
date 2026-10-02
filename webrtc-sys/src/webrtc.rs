@@ -149,8 +149,9 @@ pub mod ffi {
         /// Sets `nExtraOutputDelay` for NVENC encoders created from now on.
         /// Takes effect on the next encoder creation, never mid-stream.
         fn nvenc_set_output_delay(delay: u32);
-        /// Selects the NVENC effort profile (0 quality, 1 single-pass, 2 fast)
-        /// for encoders created from now on. Takes effect on the next encoder
+        /// Selects the NVENC effort profile (0 quality, 1 single-pass, 2 fast,
+        /// 3 fast with a 10 s GOP, 4 fast with spatial AQ off) for encoders
+        /// created from now on. Takes effect on the next encoder
         /// creation, never mid-stream.
         fn nvenc_set_screen_profile(profile: u32);
         /// Selects the native H.264 factory for a staff isolation run:

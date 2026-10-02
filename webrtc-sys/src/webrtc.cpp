@@ -247,7 +247,7 @@ void nvenc_set_screen_profile(uint32_t profile) {
   // Unknown ids fall back to the shipped default rather than to whatever the
   // last share happened to set: a stale process-global is the one way this
   // could silently mislabel a measurement window.
-  livekit::nvenc_screen_profile().store(profile > 3 ? 2 : profile,
+  livekit::nvenc_screen_profile().store(profile > 4 ? 2 : profile,
                                         std::memory_order_relaxed);
 }
 

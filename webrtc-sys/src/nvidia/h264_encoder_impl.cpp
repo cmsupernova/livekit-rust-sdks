@@ -356,9 +356,14 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   // --- Adaptive quantisation -------------------------------------------------
   // Spatial AQ: per-macroblock QP adjustment based on spatial complexity —
   // more bits for flat/detailed regions (skin, text, UI), fewer for noisy
-  // regions where the extra bits would be wasted. ~0% perf cost on Turing+
-  // NVENC, visible quality improvement (≈5-10% QP reduction in detail areas).
-  // Strength 8/15 is NVIDIA's recommended balance for mixed content.
+  // regions where the extra bits would be wasted. Visible quality
+  // improvement (≈5-10% QP reduction in detail areas). Strength 8/15 is
+  // NVIDIA's recommended balance for mixed content.
+  //
+  // Not free under a game: the NVENC programming guide lists all adaptive
+  // quantization modes among the encoder features that run on CUDA, so AQ
+  // competes for the 3D engine's time slices while the NVENC engine itself
+  // sits mostly idle. Profile 4 is the staff A/B arm that turns it off.
   //
   // Temporal AQ is intentionally NOT enabled here: it requires
   // `numRefFrames >= 2` and `enablePTD = 1`, neither of which is configured
@@ -368,8 +373,9 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
   // crashes (no stack trace, the host process just disappears) on the first
   // encode call. Leave it off until we have a full CAPS-query + ref-buffer
   // reconfig path.
-  nv_encode_config_.rcParams.enableAQ = 1;
-  nv_encode_config_.rcParams.aqStrength = 8;
+  const bool spatial_aq = screen_profile_ != 4;
+  nv_encode_config_.rcParams.enableAQ = spatial_aq ? 1 : 0;
+  nv_encode_config_.rcParams.aqStrength = spatial_aq ? 8 : 0;
 
   // --- Screenshare loss-recovery bound (2 s GOP) ----------------------------
   // Field data (two independent viewers logging the same stream) showed that

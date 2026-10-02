@@ -98,6 +98,7 @@ struct NvencTimingCounters {
 //   1  single-pass  P5, multipass disabled
 //   2  fast         P3, multipass disabled (production default)
 //   3  fast-gop10   P3, multipass disabled, 10 s periodic GOP
+//   4  fast-no-aq   P3, multipass disabled, spatial AQ off
 //
 // The field measurement this exists to settle: NVENC bitstream waits of 20-25ms
 // against a 16.7ms budget at 2560x1350, while QP sat at 14-28. That much QP
