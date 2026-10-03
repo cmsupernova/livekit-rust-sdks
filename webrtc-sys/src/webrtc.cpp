@@ -228,6 +228,16 @@ livekit_ffi::NvencTiming nvenc_timing_take() {
   out.latency_us = c.latency_us.exchange(0, std::memory_order_relaxed);
   out.latency_max_us = c.latency_max_us.exchange(0, std::memory_order_relaxed);
   out.latency_frames = c.latency_frames.exchange(0, std::memory_order_relaxed);
+  out.frame_age_us = c.frame_age_us.exchange(0, std::memory_order_relaxed);
+  out.frame_age_max_us =
+      c.frame_age_max_us.exchange(0, std::memory_order_relaxed);
+  out.frame_age_frames =
+      c.frame_age_frames.exchange(0, std::memory_order_relaxed);
+  out.pending_depth = c.pending_depth.load(std::memory_order_relaxed);
+  // Restart the window's maximum at the current depth, not zero: frames
+  // still held at the boundary are part of the next window too.
+  out.pending_depth_max = c.pending_depth_max.exchange(
+      out.pending_depth, std::memory_order_relaxed);
   out.key_wait_us = c.key_wait_us.exchange(0, std::memory_order_relaxed);
   out.key_wait_max_us =
       c.key_wait_max_us.exchange(0, std::memory_order_relaxed);
@@ -240,6 +250,19 @@ livekit_ffi::NvencTiming nvenc_timing_take() {
       c.delta_wait_frames.exchange(0, std::memory_order_relaxed);
   // Not drained: it describes the configuration this window ran under.
   out.output_delay = livekit::nvenc_output_delay().load(std::memory_order_relaxed);
+  return out;
+}
+
+livekit_ffi::NvencEncodeState nvenc_encode_state() {
+  auto& c = livekit::nvenc_timing();
+  livekit_ffi::NvencEncodeState out{};
+  const auto now = livekit::nvenc_now_us();
+  const auto started = c.last_encode_start_us.load(std::memory_order_acquire);
+  const auto active = c.active_encode_us.load(std::memory_order_acquire);
+  out.since_start_us = started == 0 ? UINT64_MAX
+                       : started <= now ? now - started
+                                        : 0;
+  if (active != 0 && active <= now) out.active_age_us = now - active;
   return out;
 }
 

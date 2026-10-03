@@ -82,6 +82,8 @@ class NvidiaH264EncoderImpl : public VideoEncoder {
     ::webrtc::VideoRotation rotation = ::webrtc::kVideoRotation_0;
     std::optional<::webrtc::ColorSpace> color_space;
     int64_t submit_us = 0;
+    // The frame's own timestamp, webrtc::TimeMicros() domain.
+    int64_t frame_us = 0;
   };
 
   int32_t ProcessEncodedFrame(std::vector<uint8_t>& packet,

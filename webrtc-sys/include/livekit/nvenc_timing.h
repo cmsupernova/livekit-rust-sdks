@@ -24,8 +24,9 @@
 //
 // Deliberately counters rather than per-frame logs: this runs at up to 60Hz on
 // the hot path, so it accumulates lock-free and is drained on the stats tick.
-// Relaxed ordering is right here - these are diagnostics, never control flow,
-// and a torn read costs at most one skewed sample.
+// Relaxed ordering is right for the diagnostics, where a torn read costs at
+// most one skewed sample. The two encode-start stamps are also read for
+// capture admission (nvenc_encode_state), so they are release/acquire.
 namespace livekit {
 
 // Upper edges, in microseconds, of the bitstream-wait histogram. Means hide
@@ -49,6 +50,15 @@ inline constexpr uint64_t kNvencWaitBucketUpperUs[kNvencWaitBucketCount] = {
 struct NvencTimingCounters {
   // Not drained: completion histograms cannot describe a call still blocked.
   std::atomic<uint64_t> active_encode_us{0};
+  // Not drained: when the most recent Encode call began, 0 while no NVENC
+  // encoder exists. A frame the capturer handed over after this has not
+  // reached the encoder yet, which is how a capturer converting on demand
+  // knows one is already waiting.
+  std::atomic<uint64_t> last_encode_start_us{0};
+  // Frames NVENC holds, submitted with no bitstream back yet. Exactly the
+  // output delay in steady state; the current depth is not drained.
+  std::atomic<uint64_t> pending_depth{0};
+  std::atomic<uint64_t> pending_depth_max{0};
   std::atomic<uint64_t> copy_us{0};
   std::atomic<uint64_t> submit_us{0};
   std::atomic<uint64_t> wait_us{0};
@@ -71,6 +81,14 @@ struct NvencTimingCounters {
   std::atomic<uint64_t> latency_us{0};
   std::atomic<uint64_t> latency_max_us{0};
   std::atomic<uint64_t> latency_frames{0};
+  // Frame timestamp to bitstream-available, per frame: the time a frame
+  // spent queued in WebRTC ahead of Encode plus its time inside NVENC. The
+  // timestamp is the source's aligned capture time, and the aligner folds
+  // the capturer's mean capture-to-handover lag into its clock offset, so a
+  // capturer adds its own mean lag to get capture to output.
+  std::atomic<uint64_t> frame_age_us{0};
+  std::atomic<uint64_t> frame_age_max_us{0};
+  std::atomic<uint64_t> frame_age_frames{0};
   // Actual encoded picture type, classified after the H.264 bitstream is
   // returned. This includes periodic GOP IDRs (which are not marked in the
   // input pic params), so it can answer whether the 2 s keyframe cadence is
@@ -305,7 +323,9 @@ inline uint64_t nvenc_now_us() {
 class NvencActiveEncode {
  public:
   NvencActiveEncode() {
-    nvenc_timing().active_encode_us.store(nvenc_now_us(), std::memory_order_release);
+    const uint64_t now = nvenc_now_us();
+    nvenc_timing().last_encode_start_us.store(now, std::memory_order_release);
+    nvenc_timing().active_encode_us.store(now, std::memory_order_release);
   }
   ~NvencActiveEncode() {
     nvenc_timing().active_encode_us.store(0, std::memory_order_release);
@@ -351,6 +371,34 @@ inline void nvenc_note_latency(uint64_t latency_us) {
          !c.latency_max_us.compare_exchange_weak(prev_max, latency_us,
                                                  std::memory_order_relaxed)) {
   }
+}
+
+inline void nvenc_note_frame_age(uint64_t age_us) {
+  NvencTimingCounters& c = nvenc_timing();
+  c.frame_age_us.fetch_add(age_us, std::memory_order_relaxed);
+  c.frame_age_frames.fetch_add(1, std::memory_order_relaxed);
+  uint64_t prev_max = c.frame_age_max_us.load(std::memory_order_relaxed);
+  while (age_us > prev_max &&
+         !c.frame_age_max_us.compare_exchange_weak(prev_max, age_us,
+                                                   std::memory_order_relaxed)) {
+  }
+}
+
+inline void nvenc_note_pending_depth(uint64_t depth) {
+  NvencTimingCounters& c = nvenc_timing();
+  c.pending_depth.store(depth, std::memory_order_relaxed);
+  uint64_t prev_max = c.pending_depth_max.load(std::memory_order_relaxed);
+  while (depth > prev_max &&
+         !c.pending_depth_max.compare_exchange_weak(prev_max, depth,
+                                                    std::memory_order_relaxed)) {
+  }
+}
+
+// No NVENC encoder exists any more: nothing is encoding or waiting.
+inline void nvenc_note_encoder_released() {
+  NvencTimingCounters& c = nvenc_timing();
+  c.last_encode_start_us.store(0, std::memory_order_release);
+  c.pending_depth.store(0, std::memory_order_relaxed);
 }
 
 inline void nvenc_note_frame_type_wait(uint64_t wait_us, bool keyframe) {

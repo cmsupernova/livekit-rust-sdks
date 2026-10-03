@@ -45,6 +45,16 @@ pub mod ffi {
         pub latency_us: u64,
         pub latency_max_us: u64,
         pub latency_frames: u64,
+        /// Frame timestamp to output: queued in WebRTC plus held in NVENC.
+        /// The timestamp is the source's aligned capture time, which folds
+        /// the capturer's mean handover lag into its offset.
+        pub frame_age_us: u64,
+        pub frame_age_max_us: u64,
+        pub frame_age_frames: u64,
+        /// Frames NVENC holds with no bitstream back yet: now, and the most
+        /// over the window.
+        pub pending_depth: u64,
+        pub pending_depth_max: u64,
         pub key_wait_us: u64,
         pub key_wait_max_us: u64,
         pub key_wait_frames: u64,
@@ -54,6 +64,17 @@ pub mod ffi {
         /// Extra NVENC output surfaces currently configured, so a measurement
         /// window records which arm of an A/B produced it.
         pub output_delay: u64,
+    }
+
+    /// NVENC's encode state right now, not drained. For a capturer deciding
+    /// whether another frame would be used or discarded.
+    #[derive(Debug, Clone, Copy)]
+    pub struct NvencEncodeState {
+        /// Age of an Encode call in progress, 0 when idle.
+        pub active_age_us: u64,
+        /// Time since the most recent Encode call began. u64::MAX while no
+        /// NVENC encoder exists.
+        pub since_start_us: u64,
     }
 
     /// Last MFT encoder attempt: which init stage was reached (or failed),
@@ -146,6 +167,9 @@ pub mod ffi {
         /// `encode_ms_per_frame` stat into host->device copy, submit and
         /// bitstream wait so the dominant cost is identifiable.
         fn nvenc_timing_take() -> NvencTiming;
+        /// Whether NVENC is encoding now and when its last Encode began.
+        /// Never drains anything.
+        fn nvenc_encode_state() -> NvencEncodeState;
         /// Sets `nExtraOutputDelay` for NVENC encoders created from now on.
         /// Takes effect on the next encoder creation, never mid-stream.
         fn nvenc_set_output_delay(delay: u32);
