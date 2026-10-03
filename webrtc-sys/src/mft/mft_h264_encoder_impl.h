@@ -71,6 +71,7 @@ class MftH264EncoderImpl : public VideoEncoder {
                               uint64_t texture_adapter);
   bool ConfigureCodecBeforeMediaType();
   bool ReadBackRateControl();
+  void ApplyHrdBuffer(uint32_t target_bps, uint32_t framerate);
   long CreateInputType(IMFMediaType** type);
   bool ConfigureInputType();
 
@@ -177,6 +178,7 @@ class MftH264EncoderImpl : public VideoEncoder {
   uint64_t last_key_frame_us_ = 0;
   bool mf_started_ = false;
   bool bitrate_failure_logged_ = false;
+  bool hrd_failure_logged_ = false;
   bool runtime_failed_ = false;
   MftProgressWatchdog progress_;
   std::string encoder_name_ = "Windows MFT H264 Encoder";

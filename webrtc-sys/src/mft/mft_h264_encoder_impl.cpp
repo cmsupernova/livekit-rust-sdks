@@ -122,6 +122,13 @@ constexpr int32_t kSkipFrame = 2;
 // Screen-share QP floor, NVENC's inter value (nvidia/h264_encoder_impl.cpp
 // says why).
 constexpr UINT32 kScreenMinQp = 18;
+// CBR buffer, in frames at the current rate. NVENC runs a one-frame VBV and
+// lets a keyframe take two (lowDelayKeyFrameScale = 2); two frames here caps
+// a keyframe the same way.
+// At the vendor default, an AMD share at a few hundred kbps sent 1.3-1.9x its
+// target, mostly the periodic IDRs, and the send queue those bursts built read
+// as congestion and cut the estimate again, down to 300 kbps.
+constexpr uint64_t kHrdBufferFrames = 2;
 
 // MFTEnum2 arrived in Windows 10 1703. It is looked up at run time: as a
 // load-time import it would stop the whole app from starting on older builds.
@@ -414,6 +421,7 @@ bool MftH264EncoderImpl::ConfigureCodecBeforeMediaType() {
     // A later SetRates call still gets a chance to prove that live updates
     // work; only inability to select CBR is fatal at initialization.
   }
+  ApplyHrdBuffer(target_bps_, max_framerate_);
 
   VARIANT low_latency;
   VariantInit(&low_latency);
@@ -510,6 +518,48 @@ bool MftH264EncoderImpl::ReadBackRateControl() {
   }
   VariantClear(&value);
   return true;
+}
+
+// Caps every frame, IDRs included, at kHrdBufferFrames of the target rate.
+// For H.264 the MFT takes the HRD size in bytes. Re-applied on every rate
+// change: a cap sized for the starting bitrate is seconds of a low one.
+void MftH264EncoderImpl::ApplyHrdBuffer(uint32_t target_bps,
+                                        uint32_t framerate) {
+  if (!codec_api_ || target_bps == 0)
+    return;
+  const uint64_t fps = std::max<uint32_t>(1u, framerate);
+  const uint64_t bytes =
+      (static_cast<uint64_t>(target_bps) * kHrdBufferFrames + 8 * fps - 1) /
+      (8 * fps);
+  const UINT32 size = static_cast<UINT32>(bytes);
+
+  auto& diag = livekit::mft_diag();
+  diag.flags.fetch_and(~(16384u | 32768u), std::memory_order_relaxed);
+  VARIANT val;
+  VariantInit(&val);
+  val.vt = VT_UI4;
+  val.ulVal = size;
+  HRESULT hr = codec_api_->SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
+  if (FAILED(hr)) {
+    if (!hrd_failure_logged_) {
+      hrd_failure_logged_ = true;
+      RTC_LOG(LS_WARNING) << "MFT rejected a " << size
+                          << "-byte HRD buffer: 0x" << std::hex << hr;
+    }
+    return;
+  }
+  livekit::mft_diag_flag(16384);
+
+  // A driver that rounds is fine; one that clamps to a larger buffer is not
+  // capping the burst.
+  VARIANT actual;
+  VariantInit(&actual);
+  hr = codec_api_->GetValue(&CODECAPI_AVEncCommonBufferSize, &actual);
+  if (SUCCEEDED(hr) && actual.vt == VT_UI4 &&
+      actual.ulVal <= size + size / 10) {
+    livekit::mft_diag_flag(32768);
+  }
+  VariantClear(&actual);
 }
 
 long MftH264EncoderImpl::CreateInputType(IMFMediaType** type) {
@@ -1903,6 +1953,7 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
             livekit::mft_diag_stage(10, 0);
           target_bps_ = new_target_bps;
           bitrate_failure_logged_ = false;
+          ApplyHrdBuffer(new_target_bps, new_framerate);
         } else {
           // A repeated write of the same value will not make a driver that
           // clamps or ignores it change its mind, and some MFTs re-prime on a
@@ -1927,6 +1978,7 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
           livekit::mft_diag_stage(10, 0);
         target_bps_ = new_target_bps;
         bitrate_failure_logged_ = false;
+        ApplyHrdBuffer(new_target_bps, new_framerate);
       }
       VariantClear(&actual);
     } else {
