@@ -72,6 +72,9 @@ class MftH264EncoderImpl : public VideoEncoder {
   bool ConfigureCodecBeforeMediaType();
   bool ReadBackRateControl();
   void ApplyHrdBuffer(uint32_t target_bps, uint32_t framerate);
+  // The mean bitrate to give the MFT for `target_bps` at the frame rate
+  // frames actually arrive at.
+  uint32_t MftBitrateFor(uint32_t target_bps, uint32_t framerate) const;
   long CreateInputType(IMFMediaType** type);
   bool ConfigureInputType();
 
@@ -169,6 +172,12 @@ class MftH264EncoderImpl : public VideoEncoder {
   uint32_t height_ = 0;
   uint32_t target_bps_ = 0;
   uint32_t max_framerate_ = 30;
+  // Frame rate in the output media type. SetRates moves max_framerate_ to
+  // the input rate; the media type keeps what it was configured with.
+  uint32_t media_type_fps_ = 30;
+  // The vendor's rate control gives each frame mean bitrate / media_type_fps_
+  // however fast frames arrive (AMD).
+  bool rate_from_media_fps_ = false;
   bool sending_ = false;
   bool key_frame_request_ = false;
   // mft_now_us() of the last keyframe output (or periodic keyframe request),

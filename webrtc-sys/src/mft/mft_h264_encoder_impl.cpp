@@ -129,6 +129,10 @@ constexpr UINT32 kScreenMinQp = 18;
 // target, mostly the periodic IDRs, and the send queue those bursts built read
 // as congestion and cut the estimate again, down to 300 kbps.
 constexpr uint64_t kHrdBufferFrames = 2;
+// Most a slow source scales the MFT's bitrate up (see MftBitrateFor). A
+// source that jumps back to the full rate overshoots by this much until the
+// next SetRates, each frame still bounded by the HRD buffer.
+constexpr uint64_t kMaxRateScale = 2;
 
 // MFTEnum2 arrived in Windows 10 1703. It is looked up at run time: as a
 // load-time import it would stop the whole app from starting on older builds.
@@ -287,6 +291,18 @@ bool MftH264EncoderImpl::CreateMftEncoder(UINT32 candidate_index,
   }
   CoTaskMemFree(friendly_name);
 
+  // Only AMD's MFT has been measured budgeting frames by the media type's
+  // rate; another vendor's may already follow the sample clock.
+  WCHAR* vendor = nullptr;
+  UINT32 vendor_length = 0;
+  if (SUCCEEDED(activates[candidate_index]->GetAllocatedString(
+          MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, &vendor, &vendor_length)) &&
+      vendor && vendor_length >= 8) {
+    rate_from_media_fps_ =
+        CompareStringOrdinal(vendor, 8, L"VEN_1002", 8, TRUE) == CSTR_EQUAL;
+  }
+  CoTaskMemFree(vendor);
+
   // Which adapter this hardware MFT runs on, for texture input: the filter
   // when there was one, else whatever the activate says (often nothing).
   adapter_luid_ = adapter_luid;
@@ -362,6 +378,7 @@ bool MftH264EncoderImpl::ConfigureOutputType() {
   out_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
   MFSetAttributeSize(out_type.Get(), MF_MT_FRAME_SIZE, width_, height_);
   MFSetAttributeRatio(out_type.Get(), MF_MT_FRAME_RATE, max_framerate_, 1);
+  media_type_fps_ = max_framerate_;
   out_type->SetUINT32(MF_MT_AVG_BITRATE, target_bps_);
   out_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
   out_type->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
@@ -560,6 +577,22 @@ void MftH264EncoderImpl::ApplyHrdBuffer(uint32_t target_bps,
     livekit::mft_diag_flag(32768);
   }
   VariantClear(&actual);
+}
+
+// AMD's rate control spends mean bitrate / the media type's frame rate on each
+// frame, however fast frames arrive: a game drawing 37fps into a 60fps type
+// sent 37/60 of its target, at a higher QP than the link called for. Scaling
+// the bitrate by that ratio gives the frames that do arrive the target between
+// them. The HRD buffer is sized from the real target and rate, so it is still
+// two of those frames.
+uint32_t MftH264EncoderImpl::MftBitrateFor(uint32_t target_bps,
+                                           uint32_t framerate) const {
+  if (!rate_from_media_fps_ || framerate == 0 || framerate >= media_type_fps_)
+    return target_bps;
+  const uint64_t scaled =
+      static_cast<uint64_t>(target_bps) * media_type_fps_ / framerate;
+  return static_cast<uint32_t>(
+      std::min<uint64_t>(scaled, target_bps * kMaxRateScale));
 }
 
 long MftH264EncoderImpl::CreateInputType(IMFMediaType** type) {
@@ -867,6 +900,7 @@ int32_t MftH264EncoderImpl::Release() {
   runtime_failed_ = false;
   progress_.Reset();
   encoder_name_ = "Windows MFT H264 Encoder";
+  rate_from_media_fps_ = false;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -1926,27 +1960,30 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
   max_framerate_ = new_framerate;
 
   if (codec_api_) {
+    const uint32_t mft_bps = MftBitrateFor(new_target_bps, new_framerate);
     VARIANT val;
     VariantInit(&val);
     val.vt = VT_UI4;
-    val.ulVal = new_target_bps;
+    val.ulVal = mft_bps;
     HRESULT hr =
         codec_api_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
     auto& diag = livekit::mft_diag();
-    diag.flags.fetch_and(~512u, std::memory_order_relaxed);
+    diag.flags.fetch_and(~(512u | 65536u), std::memory_order_relaxed);
     if (SUCCEEDED(hr)) {
       livekit::mft_diag_flag(256);
+      if (mft_bps != new_target_bps)
+        livekit::mft_diag_flag(65536);
 
       VARIANT actual;
       VariantInit(&actual);
       HRESULT read_hr =
           codec_api_->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &actual);
       if (SUCCEEDED(read_hr) && actual.vt == VT_UI4) {
-        const uint32_t actual_delta = actual.ulVal > new_target_bps
-                                          ? actual.ulVal - new_target_bps
-                                          : new_target_bps - actual.ulVal;
+        const uint32_t actual_delta = actual.ulVal > mft_bps
+                                          ? actual.ulVal - mft_bps
+                                          : mft_bps - actual.ulVal;
         const uint32_t tolerance =
-            std::max<uint32_t>(100000u, new_target_bps / 20u);
+            std::max<uint32_t>(100000u, mft_bps / 20u);
         if (actual_delta <= tolerance) {
           livekit::mft_diag_flag(512);
           if (diag.stage.load(std::memory_order_relaxed) != 11)
@@ -1966,7 +2003,7 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
             bitrate_failure_logged_ = true;
             RTC_LOG(LS_ERROR)
                 << "MFT accepted but did not apply bitrate update: "
-                << "requested=" << new_target_bps
+                << "requested=" << mft_bps
                 << " readback=" << actual.ulVal;
           }
         }
@@ -1986,7 +2023,7 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
       if (!bitrate_failure_logged_) {
         bitrate_failure_logged_ = true;
         RTC_LOG(LS_ERROR) << "MFT rejected live bitrate update to "
-                          << new_target_bps << " bps: 0x" << std::hex << hr;
+                          << mft_bps << " bps: 0x" << std::hex << hr;
       }
     }
   }

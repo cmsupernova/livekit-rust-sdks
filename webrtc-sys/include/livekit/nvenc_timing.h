@@ -167,7 +167,8 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // min QP was already at or above it (neither: it could not report one),
 // 16384 the latest frame-sized CBR buffer (HRD) was accepted, 32768 its
 // readback was no larger than asked (accepted only: the MFT could not report
-// it, or clamped it up).
+// it, or clamped it up), 65536 the latest bitrate given to the MFT was scaled
+// up for frames arriving below the media type's rate.
 //
 // D3D stages (texture input, see d3d_input_requested below), with what the
 // d3d hr field holds: 0 not requested or not a screen share; 1 no hardware
