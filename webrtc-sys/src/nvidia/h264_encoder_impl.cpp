@@ -1002,7 +1002,9 @@ void NvidiaH264EncoderImpl::SetRates(
   // everything, so it sails past `< 1.0` and the cast below is UB. Ported
   // from upstream #1297, which also confirmed our bps->kbps maxBitrate fix.
   if (!std::isfinite(parameters.framerate_fps) ||
-      parameters.framerate_fps < 1.0) {
+      parameters.framerate_fps < 1.0 ||
+      parameters.framerate_fps >
+          static_cast<double>(std::numeric_limits<uint32_t>::max())) {
     RTC_LOG(LS_WARNING) << "Invalid frame rate: " << parameters.framerate_fps;
     return;
   }
@@ -1034,11 +1036,8 @@ void NvidiaH264EncoderImpl::SetRates(
     return;
   }
 
-  codec_.maxFramerate = new_framerate;
-  codec_.maxBitrate = new_target_bps / 1000;
-  configuration_.target_bps = new_target_bps;
-  configuration_.max_frame_rate = parameters.framerate_fps;
-
+  const auto previous_config = nv_encode_config_;
+  const auto previous_initialize = nv_initialize_params_;
   nv_encode_config_.rcParams.averageBitRate = new_target_bps;
   // Inert in CBR mode (NVENC ignores maxBitRate); kept for VBR parity.
   nv_encode_config_.rcParams.maxBitRate =
@@ -1074,7 +1073,17 @@ void NvidiaH264EncoderImpl::SetRates(
     encoder_->Reconfigure(&reconfigure_params);
   } catch (const NVENCException& e) {
     RTC_LOG(LS_ERROR) << "NVENC reconfigure failed: " << e.what();
+    nv_encode_config_ = previous_config;
+    nv_initialize_params_ = previous_initialize;
+    return;
   }
+
+  // Upstream #1297: only record rates the encoder accepted. Preserve Rift's
+  // hysteresis, frame-sized VBV, wall-clock GOP and texture input settings.
+  codec_.maxFramerate = new_framerate;
+  codec_.maxBitrate = new_target_bps / 1000;
+  configuration_.target_bps = new_target_bps;
+  configuration_.max_frame_rate = parameters.framerate_fps;
 
   if (configuration_.target_bps) {
     configuration_.SetStreamState(true);

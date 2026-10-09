@@ -79,6 +79,7 @@ NvidiaVideoDecoderFactory::NvidiaVideoDecoderFactory()
     }
   } else {
     RTC_LOG(LS_ERROR) << "Failed to initialize CUDA context.";
+    cu_context_ = nullptr;
   }
   RTC_LOG(LS_INFO) << "NvidiaVideoDecoderFactory created with "
                    << supported_formats_.size() << " supported formats.";
@@ -104,11 +105,12 @@ std::unique_ptr<VideoDecoder> NvidiaVideoDecoderFactory::Create(
     if (format.IsSameCodec(supported_format)) {
       // If the format is supported, create and return the decoder.
       if (!cu_context_) {
-        cu_context_ = livekit_ffi::CudaContext::GetInstance();
-        if (!cu_context_->Initialize()) {
+        auto* context = livekit_ffi::CudaContext::GetInstance();
+        if (!context->Initialize()) {
           RTC_LOG(LS_ERROR) << "Failed to initialize CUDA context.";
           return nullptr;
         }
+        cu_context_ = context;
       }
       CUcontext context = cu_context_->GetContext();
       if (!context) {

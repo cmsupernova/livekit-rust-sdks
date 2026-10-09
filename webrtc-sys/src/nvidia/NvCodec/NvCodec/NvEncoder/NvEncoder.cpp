@@ -389,6 +389,9 @@ void NvEncoder::CreateEncoder(const NV_ENC_INITIALIZE_PARAMS* pEncoderParams) {
     DestroyHWEncoder();
     std::cout << "nvEncInitializeEncoder API failed" << e.getErrorCode()
               << " - " << e.getErrorString() << std::endl;
+    // Let the caller select its existing fallback instead of using a destroyed
+    // encoder as though initialization succeeded (upstream #1400).
+    throw;
   }
 
   m_bEncoderInitialized = true;

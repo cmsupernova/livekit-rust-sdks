@@ -112,6 +112,14 @@ pub mod ffi {
             stride_v: i32,
         ) -> UniquePtr<I420Buffer>;
 
+        fn new_black_i420_buffer(
+            width: i32,
+            height: i32,
+            stride_y: i32,
+            stride_u: i32,
+            stride_v: i32,
+        ) -> UniquePtr<I420Buffer>;
+
         fn new_i422_buffer(
             width: i32,
             height: i32,

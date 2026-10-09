@@ -321,6 +321,19 @@ std::unique_ptr<I420Buffer> new_i420_buffer(int width,
       webrtc::I420Buffer::Create(width, height, stride_y, stride_u, stride_v));
 }
 
+std::unique_ptr<I420Buffer> new_black_i420_buffer(int width,
+                                               int height,
+                                               int stride_y,
+                                               int stride_u,
+                                               int stride_v) {
+  // Only synthetic startup frames need clearing. Do not add this cost to
+  // every captured frame's allocation (upstream #1271).
+  auto buffer = webrtc::I420Buffer::Create(width, height, stride_y, stride_u,
+                                          stride_v);
+  webrtc::I420Buffer::SetBlack(buffer.get());
+  return std::make_unique<I420Buffer>(std::move(buffer));
+}
+
 std::unique_ptr<I422Buffer> new_i422_buffer(int width,
                                             int height,
                                             int stride_y,

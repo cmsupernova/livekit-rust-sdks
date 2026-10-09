@@ -118,6 +118,8 @@ impl PeerTransport {
 
         if inner.renegotiate {
             inner.renegotiate = false;
+            // create_and_send_offer acquires this same non-reentrant mutex (#1252).
+            drop(inner);
             self.create_and_send_offer(OfferOptions::default()).await?;
         }
 
@@ -422,6 +424,49 @@ impl PeerTransport {
 #[cfg(test)]
 mod tests {
     use super::PeerTransport;
+
+    // Upstream #1252: queue a second offer while the first answer is in flight.
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn renegotiation_does_not_deadlock() {
+        use libwebrtc::prelude::*;
+        use std::{
+            sync::{Arc, Mutex},
+            time::Duration,
+        };
+
+        let factory = PeerConnectionFactory::default();
+        let config = RtcConfiguration {
+            ice_servers: vec![],
+            continual_gathering_policy: ContinualGatheringPolicy::GatherOnce,
+            ice_transport_type: IceTransportsType::All,
+        };
+        let alice = factory.create_peer_connection(config.clone()).unwrap();
+        let bob = factory.create_peer_connection(config).unwrap();
+        let _dc = alice.create_data_channel("renegotiation", DataChannelInit::default()).unwrap();
+        let transport =
+            PeerTransport::new(alice.clone(), livekit_protocol::SignalTarget::Publisher, true);
+        let offers = Arc::new(Mutex::new(Vec::new()));
+        let emitted = offers.clone();
+        transport.on_offer(Some(Box::new(move |offer| emitted.lock().unwrap().push(offer))));
+
+        transport.create_and_send_offer(OfferOptions::default()).await.unwrap();
+        assert_eq!(alice.signaling_state(), SignalingState::HaveLocalOffer);
+        let offer = offers.lock().unwrap()[0].clone();
+        bob.set_remote_description(offer).await.unwrap();
+        let answer = bob.create_answer(AnswerOptions::default()).await.unwrap();
+        bob.set_local_description(answer.clone()).await.unwrap();
+        transport.create_and_send_offer(OfferOptions::default()).await.unwrap();
+        assert_eq!(offers.lock().unwrap().len(), 1);
+        tokio::time::timeout(Duration::from_secs(10), transport.set_remote_description(answer))
+            .await
+            .expect("deferred renegotiation deadlocked")
+            .unwrap();
+        assert_eq!(offers.lock().unwrap().len(), 2);
+        assert_eq!(alice.signaling_state(), SignalingState::HaveLocalOffer);
+        alice.close();
+        bob.close();
+    }
 
     #[test]
     fn no_vp9_or_av1_is_noop() {

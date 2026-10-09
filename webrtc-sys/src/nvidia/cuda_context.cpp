@@ -30,7 +30,8 @@ namespace livekit_ffi {
 
 #define CUCTX_CUDA_CALL_ERROR(call) \
   do {                              \
-    __CUCTX_CUDA_CALL(call, err__); \
+    /* All callers return bool; a nonzero CUDA error is not success. */ \
+    __CUCTX_CUDA_CALL(call, false); \
   } while (0)
 
 static void* s_module_ptr = nullptr;

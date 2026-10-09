@@ -221,6 +221,20 @@ impl NativeBuffer {
 }
 
 impl I420Buffer {
+    pub fn new_black(width: u32, height: u32) -> vf::I420Buffer {
+        vf::I420Buffer {
+            handle: I420Buffer {
+                sys_handle: vfb_sys::ffi::new_black_i420_buffer(
+                    width.try_into().unwrap(),
+                    height.try_into().unwrap(),
+                    width.try_into().unwrap(),
+                    ((width + 1) / 2).try_into().unwrap(),
+                    ((width + 1) / 2).try_into().unwrap(),
+                ),
+            },
+        }
+    }
+
     pub fn new(
         width: u32,
         height: u32,

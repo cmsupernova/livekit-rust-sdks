@@ -195,6 +195,11 @@ new_buffer_type!(I010Buffer, I010, as_i010);
 new_buffer_type!(NV12Buffer, NV12, as_nv12);
 
 impl I420Buffer {
+    /// Allocate a black frame for synthetic startup/keepalive use.
+    pub fn new_black(width: u32, height: u32) -> I420Buffer {
+        vf_imp::I420Buffer::new_black(width, height)
+    }
+
     pub fn with_strides(
         width: u32,
         height: u32,

@@ -64,11 +64,13 @@ std::unique_ptr<VideoEncoder> NvidiaVideoEncoderFactory::Create(
   for (const auto& supported_format : supported_formats_) {
     if (format.IsSameCodec(supported_format)) {
       if (!cu_context_) {
-        cu_context_ = livekit_ffi::CudaContext::GetInstance();
-        if (!cu_context_->Initialize()) {
+        auto* context = livekit_ffi::CudaContext::GetInstance();
+        if (!context->Initialize()) {
           RTC_LOG(LS_ERROR) << "Failed to initialize CUDA context.";
           return nullptr;
         }
+        // Do not retain a failed initialization across future Create calls (#1395).
+        cu_context_ = context;
       }
 
       // No encoder rather than one bound to a null context: the adapter then

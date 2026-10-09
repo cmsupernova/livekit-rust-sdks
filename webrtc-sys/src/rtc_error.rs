@@ -64,23 +64,63 @@ pub mod ffi {
 }
 
 impl ffi::RtcError {
-    /// # Safety
-    /// The value must be correctly encoded
-    pub unsafe fn from(value: &str) -> Self {
-        // Parse the hex encoded error from c++
-        let error_type = u32::from_str_radix(&value[0..8], 16).unwrap();
-        let error_detail = u32::from_str_radix(&value[8..16], 16).unwrap();
-        let has_scp_cause_code = u8::from_str_radix(&value[16..18], 16).unwrap();
-        let sctp_cause_code = u16::from_str_radix(&value[18..22], 16).unwrap();
-        let message = String::from(&value[22..]); // msg isn't encoded
-
-        Self {
-            error_type: std::mem::transmute(error_type),
-            error_detail: std::mem::transmute(error_detail),
-            sctp_cause_code,
-            has_sctp_cause_code: has_scp_cause_code == 1,
-            message,
+    /// Decode only complete, known headers. The UTF-8 message is not hex encoded.
+    /// Backports upstream #1098/#1466 without reporting malformed errors as success.
+    pub fn parse(value: &str) -> Option<Self> {
+        let header = value.get(..22)?;
+        if !header.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
         }
+        let error_type = match u32::from_str_radix(header.get(..8)?, 16).ok()? {
+            0 => ffi::RtcErrorType::None,
+            1 => ffi::RtcErrorType::UnsupportedOperation,
+            2 => ffi::RtcErrorType::UnsupportedParameter,
+            3 => ffi::RtcErrorType::InvalidParameter,
+            4 => ffi::RtcErrorType::InvalidRange,
+            5 => ffi::RtcErrorType::SyntaxError,
+            6 => ffi::RtcErrorType::InvalidState,
+            7 => ffi::RtcErrorType::InvalidModification,
+            8 => ffi::RtcErrorType::NetworkError,
+            9 => ffi::RtcErrorType::ResourceExhausted,
+            10 => ffi::RtcErrorType::InternalError,
+            11 => ffi::RtcErrorType::OperationErrorWithData,
+            _ => return None,
+        };
+        let error_detail = match u32::from_str_radix(header.get(8..16)?, 16).ok()? {
+            0 => ffi::RtcErrorDetailType::None,
+            1 => ffi::RtcErrorDetailType::DataChannelFailure,
+            2 => ffi::RtcErrorDetailType::DtlsFailure,
+            3 => ffi::RtcErrorDetailType::FingerprintFailure,
+            4 => ffi::RtcErrorDetailType::SctpFailure,
+            5 => ffi::RtcErrorDetailType::SdpSyntaxError,
+            6 => ffi::RtcErrorDetailType::HardwareEncoderNotAvailable,
+            7 => ffi::RtcErrorDetailType::HardwareEncoderError,
+            _ => return None,
+        };
+        let has_sctp_cause_code = match u8::from_str_radix(header.get(16..18)?, 16).ok()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        Some(Self {
+            error_type,
+            error_detail,
+            has_sctp_cause_code,
+            sctp_cause_code: u16::from_str_radix(header.get(18..22)?, 16).ok()?,
+            message: value.get(22..)?.into(),
+        })
+    }
+
+    /// # Safety
+    /// Kept unsafe for source compatibility; arbitrary strings are now accepted.
+    pub unsafe fn from(value: &str) -> Self {
+        Self::parse(value).unwrap_or_else(|| Self {
+            error_type: ffi::RtcErrorType::InternalError,
+            error_detail: ffi::RtcErrorDetailType::None,
+            sctp_cause_code: 0,
+            has_sctp_cause_code: false,
+            message: value.into(),
+        })
     }
 
     pub fn ok(&self) -> bool {
@@ -99,6 +139,59 @@ impl Display for ffi::RtcError {
 #[cfg(test)]
 mod tests {
     use crate::rtc_error::ffi::{RtcError, RtcErrorDetailType, RtcErrorType};
+
+    #[test]
+    fn malformed_headers_remain_errors_without_panicking() {
+        let valid = "0000000a00000001010018message";
+        for len in 0..22 {
+            let input = &valid[..len];
+            assert!(RtcError::parse(input).is_none());
+            let error = unsafe { RtcError::from(input) };
+            assert!(!error.ok());
+            assert_eq!(error.message, input);
+        }
+        for input in [
+            "not a serialized RTC error",
+            "ffffffff00000000000000unknown type",
+            "0000000affffffff000000unknown detail",
+            "0000000a00000000020000bad flag",
+            "+000000a00000000000000signed header",
+        ] {
+            assert!(RtcError::parse(input).is_none());
+            let error = unsafe { RtcError::from(input) };
+            assert_eq!(error.error_type, RtcErrorType::InternalError);
+            assert!(!error.ok());
+            assert_eq!(error.message, input);
+        }
+    }
+
+    #[test]
+    fn unicode_header_is_rejected_but_unicode_message_is_preserved() {
+        for offset in 0..22 {
+            for symbol in ["é", "界", "🦀"] {
+                let input = format!("{}{}{}", "0".repeat(offset), symbol, "0".repeat(24));
+                assert!(RtcError::parse(&input).is_none());
+                assert!(!unsafe { RtcError::from(&input) }.ok());
+            }
+        }
+        let error = RtcError::parse("0000000a00000000000000é界🦀").unwrap();
+        assert_eq!(error.message, "é界🦀");
+        assert!(!error.ok());
+    }
+
+    #[test]
+    fn every_known_error_type_and_detail_round_trips() {
+        for error_type in 0..=11 {
+            for detail in 0..=7 {
+                let input = format!("{error_type:08x}{detail:08x}01ffffmessage");
+                let error = RtcError::parse(&input).unwrap();
+                assert_eq!(error.ok(), error_type == 0);
+                assert!(error.has_sctp_cause_code);
+                assert_eq!(error.sctp_cause_code, u16::MAX);
+                assert_eq!(error.message, "message");
+            }
+        }
+    }
 
     #[cxx::bridge(namespace = "livekit_ffi")]
     pub mod ffi {

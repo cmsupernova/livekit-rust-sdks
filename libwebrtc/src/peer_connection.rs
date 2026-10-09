@@ -295,6 +295,39 @@ mod tests {
     use crate::{peer_connection::*, peer_connection_factory::*};
 
     #[tokio::test]
+    async fn ice_candidate_error_callbacks_keep_their_context_alive() {
+        let factory = PeerConnectionFactory::default();
+        let pc = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        let candidate = || {
+            IceCandidate::parse("0", 0, "candidate:1 1 UDP 2122260223 127.0.0.1 50000 typ host")
+                .unwrap()
+        };
+
+        // Both missing remote SDP and a closed connection must resolve each
+        // native completion callback once, without borrowing its caller's stack.
+        for closed in [false, true] {
+            if closed {
+                pc.close();
+            }
+            for _ in 0..8 {
+                let (first, second) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        tokio::join!(
+                            pc.add_ice_candidate(candidate()),
+                            pc.add_ice_candidate(candidate())
+                        )
+                    })
+                    .await
+                    .expect("ICE completion callback was lost");
+                for result in [first, second] {
+                    let err = result.expect_err("ICE cannot be added without a remote description");
+                    assert_ne!(err.message, "add_ice_candidate cancelled");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn create_pc() {
         let _ = env_logger::builder().is_test(true).try_init();
 

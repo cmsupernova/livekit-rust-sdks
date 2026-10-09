@@ -1690,19 +1690,23 @@ impl SessionInner {
     async fn close(&self, reason: DisconnectReason) {
         self.closed.store(true, Ordering::Release);
 
-        self.signal_client
-            .send(proto::signal_request::Message::Leave(proto::LeaveRequest {
-                action: proto::leave_request::Action::Disconnect.into(),
-                reason: reason as i32,
-                ..Default::default()
-            }))
-            .await;
-
-        self.signal_client.close().await;
+        // Release ICE sockets before potentially blocked signaling I/O (#1335).
         self.publisher_pc.close();
         if let Some(ref sub_pc) = self.subscriber_pc {
             sub_pc.close();
         }
+
+        let leave =
+            self.signal_client.send(proto::signal_request::Message::Leave(proto::LeaveRequest {
+                action: proto::leave_request::Action::Disconnect.into(),
+                reason: reason as i32,
+                ..Default::default()
+            }));
+        if livekit_runtime::timeout(Duration::from_secs(3), leave).await.is_err() {
+            log::warn!("timed out sending Leave; continuing session teardown");
+        }
+
+        self.signal_client.close().await;
     }
 
     async fn simulate_scenario(self: &Arc<Self>, scenario: SimulateScenario) -> EngineResult<()> {

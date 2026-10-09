@@ -173,7 +173,8 @@ impl E2eeManager {
     }
 
     pub fn enabled(&self) -> bool {
-        self.inner.lock().enabled && self.initialized()
+        let inner = self.inner.lock();
+        inner.enabled && inner.options.is_some()
     }
 
     pub fn is_dc_encryption_enabled(&self) -> bool {
@@ -181,11 +182,12 @@ impl E2eeManager {
     }
 
     pub fn set_enabled(&self, enabled: bool) {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if inner.enabled == enabled {
             return;
         }
 
+        inner.enabled = enabled;
         for (_, cryptor) in inner.frame_cryptors.iter() {
             cryptor.set_enabled(enabled);
         }
@@ -289,5 +291,38 @@ impl Debug for E2eeManager {
         f.debug_struct("E2eeManager")
             .field("enabled", &self.inner.lock().enabled)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enable_disable_enable_keeps_manager_state_in_sync() {
+        let manager = E2eeManager::new(
+            Some(E2eeOptions {
+                encryption_type: EncryptionType::Gcm,
+                key_provider: KeyProvider::new(Default::default()),
+            }),
+            true,
+        );
+        assert!(manager.enabled());
+        for enabled in [false, false, true, true, false, true] {
+            manager.set_enabled(enabled);
+            assert_eq!(manager.enabled(), enabled);
+            assert_eq!(manager.inner.lock().enabled, enabled);
+        }
+        // Media toggles must not change the independently configured data encryption.
+        assert!(manager.is_dc_encryption_enabled());
+    }
+
+    #[test]
+    fn uninitialized_manager_never_reports_encryption_enabled() {
+        let manager = E2eeManager::new(None, false);
+        manager.set_enabled(true);
+        assert!(!manager.enabled());
+        manager.set_enabled(false);
+        assert!(!manager.enabled());
     }
 }

@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use futures_util::{
+    future::{AbortHandle, Abortable},
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
 use livekit_protocol as proto;
 use livekit_runtime::{JoinHandle, TcpStream};
 use prost::Message as ProtoMessage;
-use std::{env, io, time::Duration};
+use std::{env, future::Future, io, time::Duration};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -57,6 +58,23 @@ use super::{SignalError, SignalResult};
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+// Unlike newer upstream, this fork supports multiple runtimes. Abortable lets
+// cancellation release the sockets without changing their JoinHandle APIs.
+#[derive(Debug)]
+struct StreamTaskCancellation {
+    read: AbortHandle,
+    write: AbortHandle,
+}
+
+impl Drop for StreamTaskCancellation {
+    fn drop(&mut self) {
+        self.read.abort();
+        self.write.abort();
+    }
+}
+
 #[derive(Debug)]
 enum InternalMessage {
     Signal {
@@ -77,6 +95,7 @@ pub(super) struct SignalStream {
     internal_tx: mpsc::Sender<InternalMessage>,
     read_handle: JoinHandle<()>,
     write_handle: JoinHandle<()>,
+    cancellation: StreamTaskCancellation,
 }
 
 impl SignalStream {
@@ -322,21 +341,49 @@ impl SignalStream {
 
         let (emitter, events) = mpsc::unbounded_channel();
         let (internal_tx, internal_rx) = mpsc::channel::<InternalMessage>(8);
-        let write_handle = livekit_runtime::spawn(Self::write_task(internal_rx, ws_writer));
-        let read_handle =
-            livekit_runtime::spawn(Self::read_task(internal_tx.clone(), ws_reader, emitter));
-
-        Ok((Self { internal_tx, read_handle, write_handle }, events))
+        let read_task = Self::read_task(internal_tx.clone(), ws_reader, emitter);
+        let write_task = Self::write_task(internal_rx, ws_writer);
+        Ok((Self::spawn_tasks(internal_tx, read_task, write_task), events))
     }
 
-    /// Close the websocket
-    /// It sends a CloseFrame to the server before closing
-    pub async fn close(self, notify_close: bool) {
-        if notify_close {
-            let _ = self.internal_tx.send(InternalMessage::Close).await;
+    fn spawn_tasks(
+        internal_tx: mpsc::Sender<InternalMessage>,
+        read_task: impl Future<Output = ()> + Send + 'static,
+        write_task: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        let (read, read_registration) = AbortHandle::new_pair();
+        let (write, write_registration) = AbortHandle::new_pair();
+        let read_handle = livekit_runtime::spawn(async move {
+            let _ = Abortable::new(read_task, read_registration).await;
+        });
+        let write_handle = livekit_runtime::spawn(async move {
+            let _ = Abortable::new(write_task, write_registration).await;
+        });
+        Self {
+            internal_tx,
+            read_handle,
+            write_handle,
+            cancellation: StreamTaskCancellation { read, write },
         }
-        let _ = self.write_handle.await;
-        let _ = self.read_handle.await;
+    }
+
+    /// Bound teardown even when the peer or the send queue is stuck (#1453).
+    pub async fn close(self, notify_close: bool) {
+        let Self { internal_tx, read_handle, mut write_handle, cancellation } = self;
+        if notify_close {
+            // A full queue must not stall close before its timeout even begins.
+            // Dropping the last sender below also makes the writer close.
+            let _ = internal_tx.try_send(InternalMessage::Close);
+        }
+        drop(internal_tx);
+        cancellation.read.abort();
+        read_handle.await;
+        if livekit_runtime::timeout(CLOSE_TIMEOUT, &mut write_handle).await.is_err() {
+            log::warn!("signal writer did not close in time; cancelling it");
+            cancellation.write.abort();
+            write_handle.await;
+        }
+        // The guard also cancels both tasks if this close future is dropped.
     }
 
     /// Send a SignalRequest to the websocket
@@ -417,5 +464,88 @@ impl SignalStream {
         }
 
         let _ = internal_tx.send(InternalMessage::Close).await;
+    }
+}
+
+#[cfg(all(test, feature = "signal-client-tokio"))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn close_does_not_wait_for_a_silent_peer() {
+        for notify in [true, false] {
+            let lifetime = Arc::new(());
+            let reader_lifetime = lifetime.clone();
+            let writer_lifetime = lifetime.clone();
+            let (tx, mut rx) = mpsc::channel(8);
+            let reader_tx = tx.clone();
+            let stream = SignalStream::spawn_tasks(
+                tx,
+                async move {
+                    let _owned = (reader_lifetime, reader_tx);
+                    std::future::pending::<()>().await;
+                },
+                async move {
+                    let _owned = writer_lifetime;
+                    while let Some(msg) = rx.recv().await {
+                        if matches!(msg, InternalMessage::Close) {
+                            break;
+                        }
+                    }
+                },
+            );
+            tokio::time::timeout(Duration::from_secs(1), stream.close(notify)).await.unwrap();
+            assert_eq!(Arc::strong_count(&lifetime), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_bounds_a_full_queue_and_stalled_writer() {
+        let lifetime = Arc::new(());
+        let reader_lifetime = lifetime.clone();
+        let writer_lifetime = lifetime.clone();
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(InternalMessage::Pong { ping_data: vec![] }).unwrap();
+        let stream = SignalStream::spawn_tasks(
+            tx,
+            async move {
+                let _owned = reader_lifetime;
+                std::future::pending::<()>().await;
+            },
+            async move {
+                let _owned = (writer_lifetime, rx);
+                std::future::pending::<()>().await;
+            },
+        );
+        tokio::time::timeout(CLOSE_TIMEOUT + Duration::from_secs(1), stream.close(true))
+            .await
+            .expect("full send queue blocked close");
+        assert_eq!(Arc::strong_count(&lifetime), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_close_does_not_detach_socket_tasks() {
+        let (tx, rx) = mpsc::channel(1);
+        let (reader_dropped_tx, reader_dropped_rx) = oneshot::channel::<()>();
+        let (writer_dropped_tx, writer_dropped_rx) = oneshot::channel::<()>();
+        let stream = SignalStream::spawn_tasks(
+            tx,
+            async move {
+                let _owned = reader_dropped_tx;
+                std::future::pending::<()>().await;
+            },
+            async move {
+                let _owned = (writer_dropped_tx, rx);
+                std::future::pending::<()>().await;
+            },
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(1), stream.close(false)).await.is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            assert!(reader_dropped_rx.await.is_err());
+            assert!(writer_dropped_rx.await.is_err());
+        })
+        .await
+        .expect("cancelled close left a socket task alive");
     }
 }

@@ -1,6 +1,7 @@
 #include "h265_encoder_impl.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <string>
 
@@ -398,7 +399,10 @@ void NvidiaH265EncoderImpl::SetRates(
     return;
   }
 
-  if (parameters.framerate_fps < 1.0) {
+  if (!std::isfinite(parameters.framerate_fps) ||
+      parameters.framerate_fps < 1.0 ||
+      parameters.framerate_fps >
+          static_cast<double>(std::numeric_limits<uint32_t>::max())) {
     RTC_LOG(LS_WARNING) << "Invalid frame rate: " << parameters.framerate_fps;
     return;
   }
@@ -420,11 +424,8 @@ void NvidiaH265EncoderImpl::SetRates(
     return;
   }
 
-  codec_.maxFramerate = new_framerate;
-  codec_.maxBitrate = new_target_bps;
-  configuration_.target_bps = new_target_bps;
-  configuration_.max_frame_rate = parameters.framerate_fps;
-
+  const auto previous_config = nv_encode_config_;
+  const auto previous_initialize = nv_initialize_params_;
   nv_encode_config_.rcParams.averageBitRate = new_target_bps;
   // Inert in CBR mode (NVENC ignores maxBitRate); kept for VBR parity.
   nv_encode_config_.rcParams.maxBitRate =
@@ -443,7 +444,16 @@ void NvidiaH265EncoderImpl::SetRates(
     encoder_->Reconfigure(&reconfigure_params);
   } catch (const NVENCException& e) {
     RTC_LOG(LS_ERROR) << "NVENC H265 reconfigure failed: " << e.what();
+    nv_encode_config_ = previous_config;
+    nv_initialize_params_ = previous_initialize;
+    return;
   }
+
+  // Match H.264's error handling and the codec API's kbps units (#1297).
+  codec_.maxFramerate = new_framerate;
+  codec_.maxBitrate = new_target_bps / 1000;
+  configuration_.target_bps = new_target_bps;
+  configuration_.max_frame_rate = parameters.framerate_fps;
 
   if (configuration_.target_bps) {
     configuration_.SetStreamState(true);

@@ -16,7 +16,7 @@ use libwebrtc::prelude::*;
 use livekit_api::signal_client::{SignalError, SignalOptions};
 use livekit_datatrack::backend as dt;
 use livekit_protocol as proto;
-use livekit_runtime::{interval, Interval, JoinHandle};
+use livekit_runtime::{interval, Interval, JoinHandle, MissedTickBehavior};
 use parking_lot::{RwLock, RwLockReadGuard};
 use std::{borrow::Cow, fmt::Debug, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -52,6 +52,13 @@ pub(crate) type EngineResult<T> = Result<T, EngineError>;
 
 pub const RECONNECT_ATTEMPTS: u32 = 10;
 pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+
+fn reconnect_interval() -> Interval {
+    let mut timer = interval(RECONNECT_INTERVAL);
+    // Do not spend retries on ticks accumulated during a healthy call (#786).
+    timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    timer
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SimulateScenario {
@@ -410,7 +417,7 @@ impl EngineInner {
                         }),
                         options,
                         reconnecting_lock: AsyncRwLock::default(),
-                        reconnecting_interval: AsyncMutex::new(interval(RECONNECT_INTERVAL)),
+                        reconnecting_interval: AsyncMutex::new(reconnect_interval()),
                     });
 
                     // Start initial tasks
@@ -772,6 +779,9 @@ impl EngineInner {
             )
         };
 
+        // Attempt once immediately; only subsequent retries wait. Also clear
+        // accumulated ticks on runtimes whose missed-tick policy is a no-op.
+        self.reconnecting_interval.lock().await.reset();
         for i in 0..RECONNECT_ATTEMPTS {
             let (is_closed, full_reconnect) = {
                 let running_handle = self.running_handle.read();
@@ -904,5 +914,33 @@ impl EngineInner {
 impl From<livekit_datatrack::api::InternalError> for EngineError {
     fn from(err: livekit_datatrack::api::InternalError) -> Self {
         Self::Internal(err.to_string().into())
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod reconnect_timer_tests {
+    use super::*;
+    use futures_util::FutureExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_call_time_does_not_spend_reconnect_retries() {
+        let mut timer = reconnect_interval();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        timer.reset();
+        assert!(timer.tick().now_or_never().is_none());
+        tokio::time::advance(RECONNECT_INTERVAL).await;
+        assert!(timer.tick().now_or_never().is_some());
+        assert!(timer.tick().now_or_never().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_attempt_does_not_burst_all_overdue_retries() {
+        let mut timer = reconnect_interval();
+        timer.reset();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert!(timer.tick().now_or_never().is_some());
+        assert!(timer.tick().now_or_never().is_none());
+        tokio::time::advance(RECONNECT_INTERVAL).await;
+        assert!(timer.tick().now_or_never().is_some());
     }
 }

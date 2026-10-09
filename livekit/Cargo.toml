@@ -48,6 +48,7 @@ bmrng = "0.5.2"
 base64 = "0.22"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 anyhow = "1.0.99"
 test-log = "0.2.18"
 test-case = "3.3"

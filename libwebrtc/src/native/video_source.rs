@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -49,6 +49,37 @@ struct VideoSourceInner {
     captured_frames: usize,
 }
 
+async fn startup_keepalive(
+    resolution: VideoResolution,
+    state: Weak<Mutex<VideoSourceInner>>,
+    sys_handle: SharedPtr<vt_sys::ffi::VideoTrackSource>,
+) {
+    // The task must not own the source: an abandoned share may never capture
+    // its first frame. Backports #1271/#1400 while retaining our submission lock.
+    if !state.upgrade().is_some_and(|state| state.lock().captured_frames == 0) {
+        return;
+    }
+    let i420 = I420Buffer::new_black(resolution.width, resolution.height);
+    let mut interval = interval(Duration::from_millis(100));
+    loop {
+        interval.tick().await;
+        let Some(state) = state.upgrade() else { break };
+        let inner = state.lock();
+        if inner.captured_frames > 0 {
+            break;
+        }
+
+        // Serialize the check and submission with capture_frame, so a black
+        // keepalive cannot land after the first real picture.
+        let mut builder = vf_sys::ffi::new_video_frame_builder();
+        builder.pin_mut().set_rotation(VideoRotation::VideoRotation0);
+        builder.pin_mut().set_video_frame_buffer(i420.as_ref().sys_handle());
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        builder.pin_mut().set_timestamp_us(now.as_micros() as i64);
+        sys_handle.on_captured_frame(&builder.pin_mut().build());
+    }
+}
+
 impl NativeVideoSource {
     pub fn new(resolution: VideoResolution, is_screencast: bool) -> NativeVideoSource {
         let source = Self {
@@ -59,31 +90,11 @@ impl NativeVideoSource {
             inner: Arc::new(Mutex::new(VideoSourceInner { captured_frames: 0 })),
         };
 
-        livekit_runtime::spawn({
-            let source = source.clone();
-            let i420 = I420Buffer::new(resolution.width, resolution.height);
-            async move {
-                let mut interval = interval(Duration::from_millis(100)); // 10 fps
-
-                loop {
-                    interval.tick().await;
-
-                    let inner = source.inner.lock();
-                    if inner.captured_frames > 0 {
-                        break;
-                    }
-
-                    let mut builder = vf_sys::ffi::new_video_frame_builder();
-                    builder.pin_mut().set_rotation(VideoRotation::VideoRotation0);
-                    builder.pin_mut().set_video_frame_buffer(i420.as_ref().sys_handle());
-
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-                    builder.pin_mut().set_timestamp_us(now.as_micros() as i64);
-
-                    source.sys_handle.on_captured_frame(&builder.pin_mut().build());
-                }
-            }
-        });
+        livekit_runtime::spawn(startup_keepalive(
+            resolution,
+            Arc::downgrade(&source.inner),
+            source.sys_handle.clone(),
+        ));
 
         source
     }
@@ -117,5 +128,47 @@ impl NativeVideoSource {
 
     pub fn video_resolution(&self) -> VideoResolution {
         self.sys_handle.video_resolution().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_black_frame_initializes_all_planes_including_odd_sizes() {
+        for (width, height) in [(2, 2), (17, 9), (320, 180)] {
+            let buffer = I420Buffer::new_black(width, height);
+            let (y, u, v) = buffer.data();
+            assert!(y.iter().all(|&p| p == 0));
+            assert!(u.iter().chain(v).all(|&p| p == 128));
+            assert_eq!(y.len(), (width * height) as usize);
+            assert_eq!(u.len(), (((width + 1) / 2) * ((height + 1) / 2)) as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_never_started_source_releases_capture_state() {
+        let source = NativeVideoSource::new(VideoResolution { width: 16, height: 16 }, true);
+        let state = Arc::downgrade(&source.inner);
+        tokio::task::yield_now().await;
+        drop(source);
+        assert!(state.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_task_finishes_after_capture_or_owner_drop() {
+        for captured_frames in [0, 1] {
+            let resolution = VideoResolution { width: 16, height: 16 };
+            let state = Arc::new(Mutex::new(VideoSourceInner { captured_frames }));
+            let handle = vt_sys::ffi::new_video_track_source(&resolution.clone().into(), true);
+            let task = startup_keepalive(resolution, Arc::downgrade(&state), handle);
+            if captured_frames == 0 {
+                drop(state);
+            }
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("startup keepalive retained a finished source");
+        }
     }
 }
