@@ -210,13 +210,13 @@ inline void mft_d3d_stage(uint32_t stage, uint32_t hr) {
   mft_diag().d3d_hr.store(hr, std::memory_order_relaxed);
 }
 
-// Texture input, OBS's AMF handoff over Media Foundation. The capturer
-// renders NV12 into D3D11 textures shared with a keyed mutex and says which
-// adapter it can share on (its LUID, 0 = none). A screen-share MFT on that
-// same adapter opens them on its own device and copies GPU to GPU instead of
-// reading system-memory frames, and says so through d3d_input_active. The
-// capturer sends textures only while the two agree; everything else stays on
-// the system-memory path.
+// Texture input, OBS's AMF and NVENC handoff. The capturer renders NV12 into
+// D3D11 textures shared with a keyed mutex and says which adapter it can
+// share on (its LUID, 0 = none). A screen-share encoder on that same adapter
+// (the MFT on AMD, NVENC on NVIDIA) opens them on its own device and copies
+// GPU to GPU instead of reading system-memory frames, and says so through
+// d3d_input_active. The capturer sends textures only while the two agree;
+// everything else stays on the system-memory path.
 inline std::atomic<uint64_t>& d3d_input_requested() {
   static std::atomic<uint64_t> luid{0};
   return luid;
@@ -271,7 +271,7 @@ inline uint64_t d3d_input_active_luid() {
   return claim.luid;
 }
 
-// The adapter whose MFT failed with texture input at runtime. Texture input
+// The adapter whose encoder failed with texture input. Texture input
 // is not tried there again until the app restarts: a driver that takes the
 // D3D manager and then rejects or starves on texture samples would otherwise
 // cost every later share a failed start.
@@ -286,8 +286,9 @@ inline std::atomic<uint32_t>& d3d_input_failed_hr() {
   return hr;
 }
 
-// Texture input is on an allowlist of adapter vendors (AMD). Tests flip this
-// to exercise the same path on whatever hardware MFT the machine has.
+// The MFT takes texture input on an allowlist of adapter vendors (AMD; NVENC
+// takes NVIDIA's). Tests flip this to exercise the same path on whatever
+// hardware MFT the machine has.
 inline std::atomic<bool>& d3d_input_any_vendor() {
   static std::atomic<bool> any{false};
   return any;

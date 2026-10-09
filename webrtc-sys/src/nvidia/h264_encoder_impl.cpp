@@ -28,9 +28,22 @@
 #include "third_party/libyuv/include/libyuv/planar_functions.h"
 #include "third_party/libyuv/include/libyuv/scale.h"
 
+#if defined(_WIN32)
+#include "NvEncoder/NvEncoderD3D11.h"
+#endif
+
 namespace webrtc {
 
 namespace {
+
+#if defined(_WIN32)
+constexpr UINT kNvidiaVendorId = 0x10DE;
+// Shared textures stay open across frames; the capturer's ring is smaller.
+constexpr size_t kOpenedTextureCache = 8;
+// The capturer holds a texture's mutex only while submitting its render.
+// Waiting longer than this means it is starved; drop the frame.
+constexpr DWORD kTextureAcquireMs = 10;
+#endif
 
 uint32_t FrameSizedVbvBuffer(uint32_t bitrate_bps,
                              uint32_t frame_rate_num,
@@ -129,7 +142,8 @@ NvidiaH264EncoderImpl::NvidiaH264EncoderImpl(
     CUmemorytype memory_type,
     NV_ENC_BUFFER_FORMAT nv_format,
     const SdpVideoFormat& format)
-    : env_(env),
+    : instance_id_(livekit::d3d_input_next_owner()),
+      env_(env),
       encoder_(nullptr),
       cu_context_(context),
       cu_memory_type_(memory_type),
@@ -239,37 +253,97 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
     return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
   }
 
+  // Read once, here, so the delay is fixed for the life of this encoder and
+  // every frame in `pending_frames_` was submitted under the same
+  // configuration.
+  output_delay_ = livekit::nvenc_output_delay().load(std::memory_order_relaxed);
+  pending_frames_.clear();
+
+  // Read once, here, so the preset and the multipass setting
+  // ConfigureEncodeParams applies cannot disagree, and so a profile switch
+  // mid-session cannot split one measurement window across two
+  // configurations.
+  screen_profile_ =
+      livekit::nvenc_screen_profile().load(std::memory_order_relaxed);
+
+  bool started = false;
+#if defined(_WIN32)
+  if (codec_.mode == VideoCodecMode::kScreensharing)
+    d3d_ = OpenD3DInput();
+  if (d3d_) {
+    started = StartEncoder(true);
+    if (started) {
+      texture_input_.store(true, std::memory_order_relaxed);
+      livekit::d3d_input_publish(instance_id_, d3d_->luid);
+    } else {
+      // Not tried on this adapter again until the app restarts, so a driver
+      // that refuses it does not cost every later share a failed start.
+      livekit::d3d_input_failed().store(d3d_->luid, std::memory_order_relaxed);
+      d3d_.reset();
+    }
+  }
+#endif
+  if (!started && !StartEncoder(false)) {
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+
+  livekit::nvenc_note_encoder_start(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+
+  RTC_LOG(LS_INFO) << "NVIDIA H264 NVENC initialized: "
+                   << codec_.width << "x" << codec_.height
+                   << " @ " << codec_.maxFramerate << "fps, target_bps="
+                   << configuration_.target_bps << ", input="
+                   << (texture_input_.load(std::memory_order_relaxed)
+                           ? "d3d11"
+                           : "cuda");
+
+  SimulcastRateAllocator init_allocator(env_, codec_);
+  VideoBitrateAllocation allocation =
+      init_allocator.Allocate(VideoBitrateAllocationParameters(
+          DataRate::KilobitsPerSec(codec_.startBitrate), codec_.maxFramerate));
+  SetRates(RateControlParameters(allocation, codec_.maxFramerate));
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+bool NvidiaH264EncoderImpl::StartEncoder(bool d3d11) {
   // Some NVIDIA GPUs have a limited Encode Session count.
   // We can't get the Session count, so catching NvEncThrow to avoid the crash.
   // refer:
   // https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new
   try {
+#if defined(_WIN32)
+    if (d3d11) {
+      encoder_ = std::make_unique<NvEncoderD3D11>(
+          d3d_->device.Get(), codec_.width, codec_.height, nv_format_,
+          output_delay_);
+    } else
+#endif
     if (cu_memory_type_ == CU_MEMORYTYPE_DEVICE) {
-      // Read once, here, so the delay is fixed for the life of this encoder
-      // and every frame in `pending_frames_` was submitted under the same
-      // configuration.
-      output_delay_ = livekit::nvenc_output_delay().load(std::memory_order_relaxed);
-      pending_frames_.clear();
       encoder_ = std::make_unique<NvEncoderCuda>(
           cu_context_, codec_.width, codec_.height, nv_format_, output_delay_);
     } else {
       RTC_DCHECK_NOTREACHED();
+      return false;
     }
+    ConfigureEncodeParams();
+    encoder_->CreateEncoder(&nv_initialize_params_);
   } catch (const NVENCException& e) {
     // todo: If Encoder initialization fails, need to notify for Managed side.
-    RTC_LOG(LS_ERROR) << "Failed Initialize NvEncoder " << e.what();
-    return WEBRTC_VIDEO_CODEC_ERROR;
+    RTC_LOG(LS_ERROR) << "Failed Initialize NvEncoder"
+                      << (d3d11 ? " for texture input " : " ") << e.what();
+    encoder_ = nullptr;
+    return false;
   }
+  return true;
+}
 
+void NvidiaH264EncoderImpl::ConfigureEncodeParams() {
   nv_initialize_params_.version = NV_ENC_INITIALIZE_PARAMS_VER;
   nv_encode_config_.version = NV_ENC_CONFIG_VER;
   nv_initialize_params_.encodeConfig = &nv_encode_config_;
-
-  // Read once, here, so the preset chosen below and the multipass setting
-  // applied further down cannot disagree, and so a profile switch mid-session
-  // cannot split one measurement window across two configurations.
-  screen_profile_ =
-      livekit::nvenc_screen_profile().load(std::memory_order_relaxed);
 
   GUID encodeGuid = NV_ENC_CODEC_H264_GUID;
   // P3 drops motion-search effort relative to P5. Under ULTRA_LOW_LATENCY
@@ -413,30 +487,6 @@ int32_t NvidiaH264EncoderImpl::InitEncode(
     nv_encode_config_.rcParams.minQP.qpInterB = kScreenMinQpInter;
     nv_encode_config_.rcParams.minQP.qpIntra = kScreenMinQpIntra;
   }
-
-  try {
-    encoder_->CreateEncoder(&nv_initialize_params_);
-  } catch (const NVENCException& e) {
-    RTC_LOG(LS_ERROR) << "Failed Initialize NvEncoder " << e.what();
-    return WEBRTC_VIDEO_CODEC_ERROR;
-  }
-
-  livekit::nvenc_note_encoder_start(
-      std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-
-  RTC_LOG(LS_INFO) << "NVIDIA H264 NVENC initialized: "
-                   << codec_.width << "x" << codec_.height
-                   << " @ " << codec_.maxFramerate << "fps, target_bps="
-                   << configuration_.target_bps;
-
-  SimulcastRateAllocator init_allocator(env_, codec_);
-  VideoBitrateAllocation allocation =
-      init_allocator.Allocate(VideoBitrateAllocationParameters(
-          DataRate::KilobitsPerSec(codec_.startBitrate), codec_.maxFramerate));
-  SetRates(RateControlParameters(allocation, codec_.maxFramerate));
-  return WEBRTC_VIDEO_CODEC_OK;
 }
 
 int32_t NvidiaH264EncoderImpl::RegisterEncodeCompleteCallback(
@@ -446,6 +496,9 @@ int32_t NvidiaH264EncoderImpl::RegisterEncodeCompleteCallback(
 }
 
 int32_t NvidiaH264EncoderImpl::Release() {
+#if defined(_WIN32)
+  WithdrawTextureInput();
+#endif
   if (encoder_) {
     // Drain before teardown. With a non-zero output delay the encoder is
     // still holding frames we submitted; tearing down without an EOS leaves
@@ -468,8 +521,180 @@ int32_t NvidiaH264EncoderImpl::Release() {
     cuArrayDestroy(cu_scaled_array_);
     cu_scaled_array_ = nullptr;
   }
+#if defined(_WIN32)
+  d3d_.reset();
+#endif
   return WEBRTC_VIDEO_CODEC_OK;
 }
+
+#if defined(_WIN32)
+std::unique_ptr<NvidiaH264EncoderImpl::D3DInput>
+NvidiaH264EncoderImpl::OpenD3DInput() {
+  const uint64_t luid =
+      livekit::d3d_input_requested().load(std::memory_order_relaxed);
+  if (luid == 0 ||
+      livekit::d3d_input_failed().load(std::memory_order_relaxed) == luid) {
+    return nullptr;
+  }
+  // NVENC opens on NVIDIA adapters only; elsewhere the capturer's adapter is
+  // the MFT's to take.
+  auto adapter = livekit_ffi::FindAdapterByLuid(luid);
+  DXGI_ADAPTER_DESC1 adapter_desc{};
+  if (!adapter || FAILED(adapter->GetDesc1(&adapter_desc)) ||
+      adapter_desc.VendorId != kNvidiaVendorId) {
+    return nullptr;
+  }
+
+  auto d3d = std::make_unique<D3DInput>();
+  d3d->luid = luid;
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1,
+                                      D3D_FEATURE_LEVEL_11_0};
+  HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN,
+                                 nullptr, 0, levels, ARRAYSIZE(levels),
+                                 D3D11_SDK_VERSION, &d3d->device, nullptr,
+                                 &d3d->context);
+  if (hr == E_INVALIDARG) {
+    // Runtimes without 11.1 reject the whole list.
+    hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                           levels + 1, 1, D3D11_SDK_VERSION, &d3d->device,
+                           nullptr, &d3d->context);
+  }
+  if (FAILED(hr)) {
+    RTC_LOG(LS_WARNING) << "NVENC texture input: D3D11 device failed: 0x"
+                        << std::hex << hr << std::dec;
+    return nullptr;
+  }
+  // Opening another device's NV12 texture needs extended resource sharing.
+  D3D11_FEATURE_DATA_D3D11_OPTIONS options{};
+  UINT nv12_support = 0;
+  if (FAILED(d3d->device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS,
+                                              &options, sizeof(options))) ||
+      !options.ExtendedResourceSharing ||
+      FAILED(d3d->device->CheckFormatSupport(DXGI_FORMAT_NV12,
+                                             &nv12_support)) ||
+      !(nv12_support & D3D11_FORMAT_SUPPORT_TEXTURE2D)) {
+    RTC_LOG(LS_WARNING) << "NVENC texture input: no shared NV12 support";
+    return nullptr;
+  }
+  return d3d;
+}
+
+void NvidiaH264EncoderImpl::WithdrawTextureInput() {
+  texture_input_.store(false, std::memory_order_relaxed);
+  // Only this encoder's claim; a newer encoder's stays.
+  livekit::d3d_input_withdraw(instance_id_);
+  if (d3d_)
+    d3d_->opened.clear();
+}
+
+int32_t NvidiaH264EncoderImpl::TextureInputFailed(const char* operation,
+                                                  long hr) {
+  RTC_LOG(LS_WARNING) << "NVENC texture input " << operation << " failed: 0x"
+                      << std::hex << hr << std::dec
+                      << "; taking frames from memory from here on";
+  livekit::d3d_input_failed_hr().store(static_cast<uint32_t>(hr),
+                                       std::memory_order_relaxed);
+  livekit::d3d_input_failed().store(d3d_->luid, std::memory_order_relaxed);
+  WithdrawTextureInput();
+  return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
+}
+
+int32_t NvidiaH264EncoderImpl::CopyTexture(
+    const livekit_ffi::D3D11TextureBuffer& frame,
+    ID3D11Texture2D* target) {
+  auto& d3d = *d3d_;
+  auto opened = std::find_if(d3d.opened.begin(), d3d.opened.end(),
+                             [&](const D3DInput::Opened& entry) {
+                               return entry.id == frame.texture_id();
+                             });
+  if (opened == d3d.opened.end()) {
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = d3d.device->OpenSharedResource(frame.shared_handle(),
+                                                IID_PPV_ARGS(&texture));
+    if (FAILED(hr))
+      return TextureInputFailed("open shared texture", hr);
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_NV12 ||
+        desc.Width != static_cast<UINT>(encoder_->GetEncodeWidth()) ||
+        desc.Height != static_cast<UINT>(encoder_->GetEncodeHeight()))
+      return TextureInputFailed("shared texture shape", E_INVALIDARG);
+    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> mutex;
+    hr = texture.As(&mutex);
+    if (FAILED(hr))
+      return TextureInputFailed("shared texture mutex", hr);
+    if (d3d.opened.size() >= kOpenedTextureCache)
+      d3d.opened.pop_front();
+    d3d.opened.push_back(
+        {frame.texture_id(), std::move(texture), std::move(mutex)});
+    opened = std::prev(d3d.opened.end());
+  }
+
+  const HRESULT acquired = opened->mutex->AcquireSync(0, kTextureAcquireMs);
+  if (acquired == static_cast<HRESULT>(WAIT_TIMEOUT))
+    return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
+  if (acquired != S_OK) {
+    // Abandoned (the capturer's device went away) or a device error.
+    d3d.opened.erase(opened);
+    return TextureInputFailed("acquire shared texture", acquired);
+  }
+  d3d.context->CopySubresourceRegion(target, 0, 0, 0, 0,
+                                     opened->texture.Get(), 0, nullptr);
+  opened->mutex->ReleaseSync(0);
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+int32_t NvidiaH264EncoderImpl::UploadFrame(const uint8_t* nv12,
+                                           uint32_t stride,
+                                           int frame_width,
+                                           int frame_height,
+                                           ID3D11Texture2D* target) {
+  auto& d3d = *d3d_;
+  const int width = static_cast<int>(encoder_->GetEncodeWidth());
+  const int height = static_cast<int>(encoder_->GetEncodeHeight());
+  if (!d3d.upload) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    const HRESULT hr =
+        d3d.device->CreateTexture2D(&desc, nullptr, &d3d.upload);
+    if (FAILED(hr)) {
+      RTC_LOG(LS_ERROR) << "NVENC upload texture failed: 0x" << std::hex << hr
+                        << std::dec;
+      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    }
+  }
+
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  const HRESULT hr =
+      d3d.context->Map(d3d.upload.Get(), 0, D3D11_MAP_WRITE, 0, &mapped);
+  if (FAILED(hr)) {
+    RTC_LOG(LS_ERROR) << "NVENC upload map failed: 0x" << std::hex << hr
+                      << std::dec;
+    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+  }
+  // Both sides are one allocation with the interleaved chroma plane after
+  // the luma rows at the same pitch, the layout the CUDA path copies.
+  const int copy_width = std::min<int>(frame_width, width);
+  const int copy_height = std::min<int>(frame_height, height);
+  auto* luma = static_cast<uint8_t*>(mapped.pData);
+  libyuv::CopyPlane(nv12, stride, luma, mapped.RowPitch, copy_width,
+                    copy_height);
+  libyuv::CopyPlane(nv12 + static_cast<size_t>(stride) * frame_height, stride,
+                    luma + static_cast<size_t>(mapped.RowPitch) * height,
+                    mapped.RowPitch, copy_width, copy_height / 2);
+  d3d.context->Unmap(d3d.upload.Get(), 0);
+  d3d.context->CopySubresourceRegion(target, 0, 0, 0, 0, d3d.upload.Get(), 0,
+                                     nullptr);
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+#endif
 
 int32_t NvidiaH264EncoderImpl::Encode(
     const VideoFrame& input_frame,
@@ -494,7 +719,19 @@ int32_t NvidiaH264EncoderImpl::Encode(
   const int w = input_frame.width();
   const int h = input_frame.height();
 
-  if (vfb->type() == VideoFrameBuffer::Type::kNV12) {
+#if defined(_WIN32)
+  // Copied on the GPU below; nothing here reads its pixels. A texture frame
+  // that arrives with texture input off is read back like any other buffer.
+  const livekit_ffi::D3D11TextureBuffer* texture_frame =
+      d3d_ && texture_input_.load(std::memory_order_relaxed)
+          ? livekit_ffi::D3D11TextureBuffer::From(vfb)
+          : nullptr;
+  const bool on_gpu = texture_frame != nullptr;
+#else
+  const bool on_gpu = false;
+#endif
+
+  if (!on_gpu && vfb->type() == VideoFrameBuffer::Type::kNV12) {
     auto nv12_ref = vfb->GetNV12();
     if (nv12_ref) {
       nv12_src = nv12_ref->DataY();
@@ -502,7 +739,7 @@ int32_t NvidiaH264EncoderImpl::Encode(
     }
   }
 
-  if (!nv12_src) {
+  if (!on_gpu && !nv12_src) {
     auto i420 = vfb->ToI420();
     if (!i420) {
       RTC_LOG(LS_ERROR) << "Failed to convert "
@@ -565,6 +802,20 @@ int32_t NvidiaH264EncoderImpl::Encode(
     const NvEncInputFrame* nv_enc_input_frame = encoder_->GetNextInputFrame();
 
     const auto t_copy = std::chrono::steady_clock::now();
+#if defined(_WIN32)
+    if (d3d_) {
+      auto* target =
+          static_cast<ID3D11Texture2D*>(nv_enc_input_frame->inputPtr);
+      const int32_t copied =
+          texture_frame
+              ? CopyTexture(*texture_frame, target)
+              : UploadFrame(static_cast<const uint8_t*>(nv12_src), nv12_stride,
+                            w, h, target);
+      if (copied != WEBRTC_VIDEO_CODEC_OK) {
+        return copied;
+      }
+    } else
+#endif
     if (cu_memory_type_ == CU_MEMORYTYPE_DEVICE) {
       NvEncoderCuda::CopyToDeviceFrame(
           cu_context_, (void*)nv12_src, nv12_stride,
@@ -724,7 +975,10 @@ int32_t NvidiaH264EncoderImpl::ProcessEncodedFrame(
 
 VideoEncoder::EncoderInfo NvidiaH264EncoderImpl::GetEncoderInfo() const {
   EncoderInfo info;
-  info.supports_native_handle = false;
+  // While true WebRTC passes D3D11TextureBuffer frames through untouched;
+  // otherwise it reads them back to system memory first.
+  info.supports_native_handle =
+      texture_input_.load(std::memory_order_relaxed);
   info.implementation_name = "NVIDIA H264 Encoder";
   info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
   info.is_hardware_accelerated = true;

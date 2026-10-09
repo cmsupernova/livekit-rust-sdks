@@ -3,6 +3,7 @@
 
 #include <cuda.h>
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -10,6 +11,13 @@
 
 #include "NvEncoder/NvEncoder.h"
 #include "NvEncoder/NvEncoderCuda.h"
+
+#if defined(_WIN32)
+#include <d3d11.h>
+#include <wrl/client.h>
+
+#include "livekit/d3d11_texture_buffer.h"
+#endif
 
 #include "absl/container/inlined_vector.h"
 #include "api/transport/rtp/dependency_descriptor.h"
@@ -88,6 +96,49 @@ class NvidiaH264EncoderImpl : public VideoEncoder {
 
   int32_t ProcessEncodedFrame(std::vector<uint8_t>& packet,
                               const PendingFrame& meta);
+  // Creates encoder_ on D3D11 (d3d_) or CUDA, configures it from codec_ and
+  // configuration_, and initializes it. On failure encoder_ is null.
+  bool StartEncoder(bool d3d11);
+  void ConfigureEncodeParams();
+
+#if defined(_WIN32)
+  // Texture input (see d3d_input_requested in nvenc_timing.h). NVENC runs on
+  // a D3D11 device on the capturer's adapter and copies its shared NV12
+  // textures on the GPU, instead of the capturer reading each frame back and
+  // CUDA uploading it again. Null on the CUDA path.
+  struct D3DInput {
+    struct Opened {
+      uint64_t id = 0;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+      Microsoft::WRL::ComPtr<IDXGIKeyedMutex> mutex;
+    };
+    uint64_t luid = 0;
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+    // System-memory frames go in through this: those sent before the
+    // capturer sees the claim, and every frame after a texture failure.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> upload;
+    // Shared textures opened on `device`, by D3D11TextureBuffer::texture_id().
+    std::deque<Opened> opened;
+  };
+  static std::unique_ptr<D3DInput> OpenD3DInput();
+  int32_t CopyTexture(const livekit_ffi::D3D11TextureBuffer& frame,
+                      ID3D11Texture2D* target);
+  int32_t UploadFrame(const uint8_t* nv12,
+                      uint32_t stride,
+                      int frame_width,
+                      int frame_height,
+                      ID3D11Texture2D* target);
+  int32_t TextureInputFailed(const char* operation, long hr);
+  void WithdrawTextureInput();
+
+  std::unique_ptr<D3DInput> d3d_;
+#endif
+  // Claim token for livekit::d3d_input_publish/withdraw.
+  const uint64_t instance_id_;
+  // Read by GetEncoderInfo, which WebRTC may call from another thread.
+  std::atomic<bool> texture_input_{false};
+
  private:
   const webrtc::Environment& env_;
   EncodedImageCallback* encoded_image_callback_ = nullptr;

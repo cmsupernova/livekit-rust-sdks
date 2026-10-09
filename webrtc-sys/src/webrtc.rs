@@ -186,7 +186,7 @@ pub mod ffi {
         fn mft_timing_take() -> MftTiming;
         /// Offers texture input: the LUID of the adapter the capturer can
         /// share NV12 textures on, or 0 to withdraw. Read when a screen-share
-        /// MFT is created, never mid-stream.
+        /// MFT or NVENC encoder is created, never mid-stream.
         fn screen_set_d3d_input_adapter(luid: u64);
         /// The adapter LUID a live encoder currently takes texture frames on,
         /// or 0. Send `NativeBuffer::from_d3d11_texture` frames only while this
