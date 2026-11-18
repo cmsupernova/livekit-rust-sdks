@@ -88,6 +88,13 @@ pub mod ffi {
         /// Texture input setup outcome and its HRESULT (see nvenc_timing.h).
         pub d3d_stage: u32,
         pub d3d_hr: u32,
+        /// The latest mean bitrate given to the MFT and what it reported
+        /// back (bps), then the frame-sized CBR buffer the same way (bytes).
+        /// Reported is 0 when the MFT could not say.
+        pub rate_asked: u32,
+        pub rate_reported: u32,
+        pub hrd_asked: u32,
+        pub hrd_reported: u32,
     }
 
     #[derive(Debug)]

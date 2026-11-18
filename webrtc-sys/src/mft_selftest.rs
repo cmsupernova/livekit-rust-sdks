@@ -1,5 +1,6 @@
-// Hardware test of MFT texture input, built only with the `mft-selftest`
-// feature on Windows. See tests/mft_d3d.rs.
+// Hardware tests of the MFT encoder, built only with the `mft-selftest`
+// feature on Windows: texture input (tests/mft_d3d.rs) and live rate control
+// (tests/mft_rate.rs).
 
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
@@ -53,6 +54,51 @@ pub mod ffi {
         pub active_after_release: u64,
     }
 
+    /// One stretch of the rate test: frames encoded at one target and rate.
+    #[derive(Debug)]
+    pub struct MftRatePhase {
+        pub name: String,
+        pub target_kbps: u32,
+        pub fps: u32,
+        /// The encoder's diagnostics straight after the rate was set (after
+        /// init for the first stretch); see MftDiagCounters.
+        pub stage: u32,
+        pub hr: u32,
+        pub flags: u32,
+        pub rate_asked: u32,
+        pub rate_reported: u32,
+        pub hrd_asked: u32,
+        pub hrd_reported: u32,
+        /// The same once the stretch's frames were in, and the encoder then.
+        pub end_stage: u32,
+        pub end_hr: u32,
+        pub end_flags: u32,
+        pub end_rate_asked: u32,
+        pub end_rate_reported: u32,
+        pub end_hrd_asked: u32,
+        pub end_hrd_reported: u32,
+        pub end_encoder: String,
+        pub first_error: i32,
+        /// The longest Encode call, which is where a rebuild shows.
+        pub encode_max_ms: u32,
+        pub frames: u32,
+        pub key_frames: u32,
+        pub total_bytes: u64,
+        /// Mean delta frame over the last third of the stretch.
+        pub late_avg_bytes: u32,
+        pub delta_max_bytes: u32,
+        pub key_max_bytes: u32,
+    }
+
+    /// The real MFT encoder, opened at 1 Mbps and 60 fps and moved through a
+    /// run of targets on content that always wants more bits.
+    #[derive(Debug)]
+    pub struct MftRateSelfTest {
+        pub encoder_name: String,
+        pub init_result: i32,
+        pub phases: Vec<MftRatePhase>,
+    }
+
     unsafe extern "C++" {
         include!("livekit/mft_d3d_selftest.h");
 
@@ -68,5 +114,20 @@ pub mod ffi {
             cpu_frames: u32,
             texture_frames: u32,
         ) -> MftD3dSelfTest;
+
+        /// Runs the `candidate`-th hardware H.264 MFT Windows lists, from
+        /// system memory, through a run of live targets. `unknown_vendor`
+        /// is mft_test_unknown_vendor. `ceiling_kbps` is the share's maximum
+        /// when the encoder opens; the targets go to 20 Mbps whatever it is.
+        /// `stretch` multiplies each stretch's length, for a run that takes
+        /// rates through rebuilds.
+        fn mft_rate_selftest(
+            candidate: u32,
+            unknown_vendor: bool,
+            ceiling_kbps: u32,
+            stretch: u32,
+            width: u32,
+            height: u32,
+        ) -> MftRateSelfTest;
     }
 }

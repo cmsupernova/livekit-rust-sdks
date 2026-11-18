@@ -133,6 +133,25 @@ constexpr uint64_t kHrdBufferFrames = 2;
 // source that jumps back to the full rate overshoots by this much until the
 // next SetRates, each frame still bounded by the HRD buffer.
 constexpr uint64_t kMaxRateScale = 2;
+// Outputs to wait before reading a live bitrate back a second time, for a
+// driver that only reports a change once it has encoded with it.
+constexpr int kRateRecheckOutputs = 3;
+// A rebuild is the last resort for an MFT that ignores live updates: the
+// encoder is closed and opened again at the new rate, which costs an IDR and
+// a few frames. A drop in the target is taken this soon after the last one;
+// anything else waits about as long as the periodic IDR, so the rebuild's IDR
+// replaces one that was due.
+constexpr uint64_t kRebuildGapUs = 1000000;
+constexpr uint64_t kRebuildSettleUs = 2200000;
+
+uint32_t AbsDiff(uint32_t a, uint32_t b) {
+  return a > b ? a - b : b - a;
+}
+
+// BWE noise below this is left to accumulate rather than re-priming the MFT.
+bool RateMoved(uint32_t from_bps, uint32_t to_bps) {
+  return AbsDiff(from_bps, to_bps) >= std::max<uint32_t>(100000u, from_bps / 20u);
+}
 
 // MFTEnum2 arrived in Windows 10 1703. It is looked up at run time: as a
 // load-time import it would stop the whole app from starting on older builds.
@@ -291,17 +310,23 @@ bool MftH264EncoderImpl::CreateMftEncoder(UINT32 candidate_index,
   }
   CoTaskMemFree(friendly_name);
 
-  // Only AMD's MFT has been measured budgeting frames by the media type's
-  // rate; another vendor's may already follow the sample clock.
+  // AMD's and Intel's MFTs were both measured budgeting frames by the media
+  // type's rate; another vendor's may already follow the sample clock.
   WCHAR* vendor = nullptr;
   UINT32 vendor_length = 0;
+  vendor_ = Vendor::kOther;
   if (SUCCEEDED(activates[candidate_index]->GetAllocatedString(
           MFT_ENUM_HARDWARE_VENDOR_ID_Attribute, &vendor, &vendor_length)) &&
       vendor && vendor_length >= 8) {
-    rate_from_media_fps_ =
-        CompareStringOrdinal(vendor, 8, L"VEN_1002", 8, TRUE) == CSTR_EQUAL;
+    if (CompareStringOrdinal(vendor, 8, L"VEN_1002", 8, TRUE) == CSTR_EQUAL)
+      vendor_ = Vendor::kAmd;
+    else if (CompareStringOrdinal(vendor, 8, L"VEN_8086", 8, TRUE) == CSTR_EQUAL)
+      vendor_ = Vendor::kIntel;
   }
   CoTaskMemFree(vendor);
+  if (livekit::mft_test_unknown_vendor().load(std::memory_order_relaxed))
+    vendor_ = Vendor::kOther;
+  rate_from_media_fps_ = vendor_ != Vendor::kOther;
 
   // Which adapter this hardware MFT runs on, for texture input: the filter
   // when there was one, else whatever the activate says (often nothing).
@@ -407,11 +432,31 @@ bool MftH264EncoderImpl::ConfigureCodecBeforeMediaType() {
   // takes effect after SetOutputType, so this must precede
   // ConfigureOutputType(). Setting it later in StartStreaming can return
   // success while leaving a vendor MFT in its default quality/VBR mode.
+  //
+  // Intel's MFT takes a live mean bitrate under peak-constrained VBR and
+  // ignores it under CBR: asked for 8 and 20 Mbps it went on reporting, and
+  // spending, the 1 Mbps it was opened at, so a share stayed at its opening
+  // bitrate for good (field report and tests/mft_rate.rs, Nov 2026). On a
+  // picture that wants every bit its VBR spends the target, as CBR would. A
+  // driver that refuses the mode gets CBR, and SetRates finds out whether its
+  // rate moves.
   VARIANT rc;
   VariantInit(&rc);
   rc.vt = VT_UI4;
-  rc.ulVal = eAVEncCommonRateControlMode_CBR;
-  HRESULT hr = codec_api_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &rc);
+  rate_mode_ = eAVEncCommonRateControlMode_CBR;
+  HRESULT hr = E_FAIL;
+  if (vendor_ == Vendor::kIntel) {
+    rc.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
+    hr = codec_api_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &rc);
+    if (SUCCEEDED(hr)) {
+      rate_mode_ = eAVEncCommonRateControlMode_PeakConstrainedVBR;
+      livekit::mft_diag_flag(131072);
+    }
+  }
+  if (FAILED(hr)) {
+    rc.ulVal = eAVEncCommonRateControlMode_CBR;
+    hr = codec_api_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &rc);
+  }
   if (SUCCEEDED(hr)) {
     livekit::mft_diag_flag(32);
   } else {
@@ -438,7 +483,9 @@ bool MftH264EncoderImpl::ConfigureCodecBeforeMediaType() {
     // A later SetRates call still gets a chance to prove that live updates
     // work; only inability to select CBR is fatal at initialization.
   }
-  ApplyHrdBuffer(target_bps_, max_framerate_);
+  applied_bps_ = target_bps_;
+  built_bps_ = target_bps_;
+  OpenHrdBuffer();
 
   VARIANT low_latency;
   VariantInit(&low_latency);
@@ -507,10 +554,10 @@ bool MftH264EncoderImpl::ReadBackRateControl() {
   HRESULT hr = codec_api_->GetValue(&CODECAPI_AVEncCommonRateControlMode,
                                     &value);
   if (SUCCEEDED(hr) && value.vt == VT_UI4) {
-    if (value.ulVal == eAVEncCommonRateControlMode_CBR) {
+    if (value.ulVal == rate_mode_) {
       livekit::mft_diag_flag(64);
     } else {
-      RTC_LOG(LS_WARNING) << "MFT rate-control readback is not CBR: "
+      RTC_LOG(LS_WARNING) << "MFT rate-control readback is not the mode set: "
                           << value.ulVal;
       livekit::mft_diag_stage(13, static_cast<uint32_t>(E_FAIL));
       VariantClear(&value);
@@ -524,17 +571,267 @@ bool MftH264EncoderImpl::ReadBackRateControl() {
 
   VariantInit(&value);
   hr = codec_api_->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &value);
+  auto& diag = livekit::mft_diag();
+  diag.rate_asked.store(target_bps_, std::memory_order_relaxed);
+  diag.rate_reported.store(0, std::memory_order_relaxed);
   if (SUCCEEDED(hr) && value.vt == VT_UI4) {
-    const uint32_t delta = value.ulVal > target_bps_
-                               ? value.ulVal - target_bps_
-                               : target_bps_ - value.ulVal;
-    const uint32_t tolerance =
-        std::max<uint32_t>(100000u, target_bps_ / 20u);
-    if (delta <= tolerance)
+    diag.rate_reported.store(value.ulVal, std::memory_order_relaxed);
+    if (!RateMoved(target_bps_, value.ulVal))
       livekit::mft_diag_flag(512);
   }
   VariantClear(&value);
   return true;
+}
+
+uint32_t MftH264EncoderImpl::HrdBytesFor(uint64_t bps, uint32_t fps) const {
+  const uint64_t per_second = 8ull * std::max<uint32_t>(1u, fps);
+  return static_cast<uint32_t>(
+      (bps * kHrdBufferFrames + per_second - 1) / per_second);
+}
+
+// The cap the encoder opens with.
+//
+// AMD's follows every rate change, so it starts at the opening rate.
+//
+// Intel under VBR gets none. A cap of a few frames made its rate control
+// give up on a picture that wants every bit: 300-byte frames where 4 KB was
+// allowed at 2 Mbps, two runs in three, through the next IDR and beyond.
+// It took a live resize only before the rate, answered each with an IDR, and
+// failed outright when the two came in the other order. Left alone it sizes
+// its own buffer from the rate it is given: a keyframe came to about 150 ms
+// of the target at 1 and 2 Mbps, with every target met (tests/mft_rate.rs).
+//
+// Anything else is not known to take a live resize. NVIDIA's MFT reads back
+// the size it opened with whatever it is given, and a cap sized for a low
+// opening rate then holds every later frame to it (6 KB a frame at 8 and at
+// 20 Mbps). So it opens sized for the ceiling, where a resize that fails
+// still leaves room.
+void MftH264EncoderImpl::OpenHrdBuffer() {
+  hrd_bytes_ = 0;
+  if (vendor_ == Vendor::kAmd) {
+    ApplyHrdBuffer(target_bps_, max_framerate_);
+    return;
+  }
+  if (rate_mode_ == eAVEncCommonRateControlMode_PeakConstrainedVBR)
+    return;
+  const uint64_t ceiling_bps =
+      std::max<uint64_t>(codec_.maxBitrate * 1000ull, target_bps_);
+  SetHrdBytes(HrdBytesFor(ceiling_bps, max_framerate_));
+}
+
+// Gives the MFT a buffer of `size` bytes and reads it back. True when the MFT
+// holds that size, or took it and cannot say what it holds.
+bool MftH264EncoderImpl::SetHrdBytes(uint32_t size) {
+  auto& diag = livekit::mft_diag();
+  diag.flags.fetch_and(~(16384u | 32768u), std::memory_order_relaxed);
+  diag.hrd_asked.store(size, std::memory_order_relaxed);
+  diag.hrd_reported.store(0, std::memory_order_relaxed);
+  VARIANT val;
+  VariantInit(&val);
+  val.vt = VT_UI4;
+  val.ulVal = size;
+  HRESULT hr = codec_api_->SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
+  if (FAILED(hr)) {
+    if (!hrd_failure_logged_) {
+      hrd_failure_logged_ = true;
+      RTC_LOG(LS_WARNING) << "MFT rejected a " << size
+                          << "-byte HRD buffer: 0x" << std::hex << hr;
+    }
+    return false;
+  }
+  livekit::mft_diag_flag(16384);
+
+  // A driver that rounds is fine. One that keeps a larger buffer is not
+  // capping the burst, and one that keeps a smaller one is holding every
+  // frame under a rate it has left behind.
+  bool held = true;
+  VARIANT actual;
+  VariantInit(&actual);
+  hr = codec_api_->GetValue(&CODECAPI_AVEncCommonBufferSize, &actual);
+  if (SUCCEEDED(hr) && actual.vt == VT_UI4) {
+    diag.hrd_reported.store(actual.ulVal, std::memory_order_relaxed);
+    held = AbsDiff(actual.ulVal, size) <= size / 10;
+    hrd_bytes_ = held ? size : actual.ulVal;
+  } else {
+    hrd_bytes_ = size;
+  }
+  VariantClear(&actual);
+  if (held)
+    livekit::mft_diag_flag(32768);
+  return held;
+}
+
+void MftH264EncoderImpl::HrdStuck() {
+  hrd_live_ = false;
+  livekit::mft_diag_flag(524288);
+}
+
+void MftH264EncoderImpl::RateStuck(uint32_t hr) {
+  rate_live_ = false;
+  rate_recheck_ = 0;
+  livekit::mft_diag_flag(262144);
+  livekit::mft_diag_stage(13, hr);
+  if (!bitrate_failure_logged_) {
+    bitrate_failure_logged_ = true;
+    RTC_LOG(LS_ERROR) << "MFT does not follow live bitrate updates (0x"
+                      << std::hex << hr << std::dec
+                      << "); rate changes will rebuild the encoder";
+  }
+}
+
+void MftH264EncoderImpl::RateConfirmed(uint32_t mft_bps, bool reported) {
+  rate_recheck_ = 0;
+  applied_bps_ = mft_bps;
+  bitrate_failure_logged_ = false;
+  if (reported)
+    livekit::mft_diag_flag(512);
+  auto& diag = livekit::mft_diag();
+  const uint32_t stage = diag.stage.load(std::memory_order_relaxed);
+  if (stage != 11 && stage != 14 && stage != 15)
+    livekit::mft_diag_stage(10, 0);
+}
+
+// Reads the mean bitrate back against `mft_bps`: 1 the MFT reports it, 0 it
+// cannot say, -1 it reports something else (left in `*reported`).
+int MftH264EncoderImpl::ReadRate(uint32_t mft_bps, uint32_t* reported) {
+  VARIANT actual;
+  VariantInit(&actual);
+  const HRESULT hr =
+      codec_api_->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &actual);
+  int result = 0;
+  if (SUCCEEDED(hr) && actual.vt == VT_UI4) {
+    *reported = actual.ulVal;
+    livekit::mft_diag().rate_reported.store(actual.ulVal,
+                                            std::memory_order_relaxed);
+    result = RateMoved(mft_bps, actual.ulVal) ? -1 : 1;
+  }
+  VariantClear(&actual);
+  return result;
+}
+
+// Every MFT but AMD's, which keeps the path it was measured on in SetRates.
+void MftH264EncoderImpl::UpdateRate(uint32_t target_bps, uint32_t framerate) {
+  max_framerate_ = framerate;
+  if (!codec_api_)
+    return;
+  if (!rate_live_) {
+    // RebuildDue() takes it from here.
+    target_bps_ = target_bps;
+    return;
+  }
+  const uint32_t mft_bps = MftBitrateFor(target_bps, framerate);
+  if (!RateMoved(applied_bps_, mft_bps))
+    return;
+  target_bps_ = target_bps;
+
+  // A cap sized for the ceiling only has to move when the target climbs past
+  // what it was sized for (the share's ceiling was raised after it opened):
+  // under two frames of the new rate it would hold the rate down. It goes
+  // before the rate, so the rate never meets a buffer that cannot hold it.
+  const uint32_t want = HrdBytesFor(mft_bps, media_type_fps_);
+  rebuild_wanted_ = false;
+  if (hrd_bytes_ != 0 && want > hrd_bytes_) {
+    if (hrd_live_ && !SetHrdBytes(want))
+      HrdStuck();
+    if (!hrd_live_ && want > hrd_bytes_) {
+      // Neither resized nor big enough: open again with a cap that is.
+      rebuild_wanted_ = true;
+      return;
+    }
+  }
+
+  VARIANT val;
+  VariantInit(&val);
+  val.vt = VT_UI4;
+  val.ulVal = mft_bps;
+  const HRESULT hr =
+      codec_api_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
+  auto& diag = livekit::mft_diag();
+  diag.flags.fetch_and(~(512u | 65536u), std::memory_order_relaxed);
+  diag.rate_asked.store(mft_bps, std::memory_order_relaxed);
+  diag.rate_reported.store(0, std::memory_order_relaxed);
+  if (FAILED(hr)) {
+    RateStuck(static_cast<uint32_t>(hr));
+    return;
+  }
+  livekit::mft_diag_flag(256);
+  if (mft_bps != target_bps)
+    livekit::mft_diag_flag(65536);
+
+  uint32_t reported = 0;
+  const int read = ReadRate(mft_bps, &reported);
+  if (read >= 0) {
+    RateConfirmed(mft_bps, read > 0);
+    return;
+  }
+  if (RateMoved(applied_bps_, reported)) {
+    // It moved, to somewhere else: a driver's own limit. That is the rate it
+    // runs at, and asking again would not change its mind.
+    livekit::mft_diag_stage(13, static_cast<uint32_t>(E_FAIL));
+    applied_bps_ = mft_bps;
+    return;
+  }
+  // It did not move. Some drivers only report a change once they have encoded
+  // with it, so look again a few frames on before calling it ignored.
+  applied_bps_ = mft_bps;
+  rate_recheck_ = kRateRecheckOutputs;
+}
+
+void MftH264EncoderImpl::RecheckRate() {
+  if (rate_recheck_ == 0 || --rate_recheck_ != 0 || !codec_api_)
+    return;
+  const uint32_t asked =
+      livekit::mft_diag().rate_asked.load(std::memory_order_relaxed);
+  uint32_t reported = 0;
+  if (ReadRate(asked, &reported) >= 0)
+    RateConfirmed(asked, true);
+  else
+    RateStuck(static_cast<uint32_t>(E_FAIL));
+}
+
+bool MftH264EncoderImpl::RebuildDue() const {
+  if (!transform_ || !callback_ || runtime_failed_ || !sending_ || event_pump_)
+    return false;
+  const uint64_t since = livekit::mft_now_us() - last_build_us_;
+  if (rebuild_wanted_)
+    return since >= kRebuildGapUs;
+  if (rate_live_ ||
+      AbsDiff(target_bps_, built_bps_) <
+          std::max<uint32_t>(100000u, built_bps_ / 10u))
+    return false;
+  // A drop is the link asking for less now.
+  const bool drop = target_bps_ < built_bps_ - built_bps_ / 8;
+  return since >= (drop ? kRebuildGapUs : kRebuildSettleUs);
+}
+
+// Closes the encoder and opens it again at the current target, for an MFT
+// that took a live update and did not act on it. What it opens with it does
+// honour: that is how every share starts. The new transform begins with an
+// IDR.
+int32_t MftH264EncoderImpl::Rebuild() {
+  VideoCodec codec = codec_;
+  const uint32_t target_bps = target_bps_;
+  const uint32_t framerate = max_framerate_;
+  EncodedImageCallback* const callback = callback_;
+  const bool rate_live = rate_live_;
+  const bool hrd_live = hrd_live_;
+  codec.startBitrate = std::max<uint32_t>(1u, target_bps / 1000);
+  // The cap opens sized for this. Past the old ceiling, leave room to climb
+  // rather than rebuilding at every step.
+  if (codec.maxBitrate != 0 && codec.maxBitrate < codec.startBitrate)
+    codec.maxBitrate = codec.startBitrate * 2;
+  Release();
+  // What this MFT was found not to do still holds for the one opened next.
+  rate_live_ = rate_live;
+  hrd_live_ = hrd_live;
+  if (InitEncodeAny(&codec) != WEBRTC_VIDEO_CODEC_OK) {
+    Release();
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+  }
+  callback_ = callback;
+  max_framerate_ = framerate;
+  RTC_LOG(LS_INFO) << "MFT rebuilt at " << target_bps << " bps";
+  return WEBRTC_VIDEO_CODEC_OK;
 }
 
 // Caps every frame, IDRs included, at kHrdBufferFrames of the target rate.
@@ -548,35 +845,7 @@ void MftH264EncoderImpl::ApplyHrdBuffer(uint32_t target_bps,
   const uint64_t bytes =
       (static_cast<uint64_t>(target_bps) * kHrdBufferFrames + 8 * fps - 1) /
       (8 * fps);
-  const UINT32 size = static_cast<UINT32>(bytes);
-
-  auto& diag = livekit::mft_diag();
-  diag.flags.fetch_and(~(16384u | 32768u), std::memory_order_relaxed);
-  VARIANT val;
-  VariantInit(&val);
-  val.vt = VT_UI4;
-  val.ulVal = size;
-  HRESULT hr = codec_api_->SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
-  if (FAILED(hr)) {
-    if (!hrd_failure_logged_) {
-      hrd_failure_logged_ = true;
-      RTC_LOG(LS_WARNING) << "MFT rejected a " << size
-                          << "-byte HRD buffer: 0x" << std::hex << hr;
-    }
-    return;
-  }
-  livekit::mft_diag_flag(16384);
-
-  // A driver that rounds is fine; one that clamps to a larger buffer is not
-  // capping the burst.
-  VARIANT actual;
-  VariantInit(&actual);
-  hr = codec_api_->GetValue(&CODECAPI_AVEncCommonBufferSize, &actual);
-  if (SUCCEEDED(hr) && actual.vt == VT_UI4 &&
-      actual.ulVal <= size + size / 10) {
-    livekit::mft_diag_flag(32768);
-  }
-  VariantClear(&actual);
+  SetHrdBytes(static_cast<uint32_t>(bytes));
 }
 
 // AMD's rate control spends mean bitrate / the media type's frame rate on each
@@ -584,7 +853,8 @@ void MftH264EncoderImpl::ApplyHrdBuffer(uint32_t target_bps,
 // sent 37/60 of its target, at a higher QP than the link called for. Scaling
 // the bitrate by that ratio gives the frames that do arrive the target between
 // them. The HRD buffer is sized from the real target and rate, so it is still
-// two of those frames.
+// two of those frames. Intel's does the same: 15fps into a 60fps type cost
+// 17 KB a frame at 8 Mbps, a quarter of the target (tests/mft_rate.rs).
 uint32_t MftH264EncoderImpl::MftBitrateFor(uint32_t target_bps,
                                            uint32_t framerate) const {
   if (!rate_from_media_fps_ || framerate == 0 || framerate >= media_type_fps_)
@@ -656,6 +926,12 @@ bool MftH264EncoderImpl::StartStreaming() {
 
 int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
                                         const VideoEncoder::Settings&) {
+  rate_live_ = true;
+  hrd_live_ = true;
+  return InitEncodeAny(inst);
+}
+
+int32_t MftH264EncoderImpl::InitEncodeAny(const VideoCodec* inst) {
   // Texture input first, from the MFTs on the capturer's adapter. It counts
   // only if texture input really comes on; anything short of that (no offer,
   // not AMD, not D3D11-aware, a failed init with the manager) falls through
@@ -668,6 +944,10 @@ int32_t MftH264EncoderImpl::InitEncode(const VideoCodec* inst,
     livekit::mft_d3d_stage(0, 0);
     UINT32 count = 1;
     for (UINT32 index = 0; index < count && index < 4; ++index) {
+      if (index != 0) {
+        rate_live_ = true;
+        hrd_live_ = true;
+      }
       const int32_t result =
           InitEncodeCandidate(inst, index, &count, texture_adapter);
       if (result == WEBRTC_VIDEO_CODEC_OK ||
@@ -694,9 +974,16 @@ int32_t MftH264EncoderImpl::InitEncodeClassic(const VideoCodec* inst) {
   // if it accepts this actual codec/resolution/rate-control configuration.
   // Startup only: no GPU hopping, no extra simultaneous encoders, and no
   // change at all for the already-working first candidate.
-  UINT32 count = 1;
+  const UINT32 first =
+      livekit::mft_test_first_candidate().load(std::memory_order_relaxed);
+  UINT32 count = first + 1;
   int32_t result = WEBRTC_VIDEO_CODEC_ERROR;
-  for (UINT32 index = 0; index < count && index < 4; ++index) {
+  for (UINT32 index = first; index < count && index < first + 4; ++index) {
+    // What one MFT was found not to do says nothing about the next.
+    if (index != first) {
+      rate_live_ = true;
+      hrd_live_ = true;
+    }
     result = InitEncodeCandidate(inst, index, &count, /*texture_adapter=*/0);
     if (result == WEBRTC_VIDEO_CODEC_OK || result == WEBRTC_VIDEO_CODEC_ERR_PARAMETER)
       return result;
@@ -762,6 +1049,15 @@ int32_t MftH264EncoderImpl::InitEncodeCandidate(const VideoCodec* inst,
   livekit::mft_diag_stage(0, 0);
   // Rate-control/async bits belong to this candidate, not a failed predecessor.
   livekit::mft_diag().flags.fetch_and(3u, std::memory_order_relaxed);
+  livekit::mft_diag().rate_asked.store(0, std::memory_order_relaxed);
+  livekit::mft_diag().rate_reported.store(0, std::memory_order_relaxed);
+  livekit::mft_diag().hrd_asked.store(0, std::memory_order_relaxed);
+  livekit::mft_diag().hrd_reported.store(0, std::memory_order_relaxed);
+  if (!rate_live_)
+    livekit::mft_diag_flag(262144);
+  if (!hrd_live_)
+    livekit::mft_diag_flag(524288);
+  last_build_us_ = livekit::mft_now_us();
   HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "MFStartup failed: 0x" << std::hex << hr;
@@ -901,6 +1197,13 @@ int32_t MftH264EncoderImpl::Release() {
   progress_.Reset();
   encoder_name_ = "Windows MFT H264 Encoder";
   rate_from_media_fps_ = false;
+  vendor_ = Vendor::kOther;
+  rate_mode_ = 0;
+  hrd_bytes_ = 0;
+  applied_bps_ = 0;
+  built_bps_ = 0;
+  rate_recheck_ = 0;
+  rebuild_wanted_ = false;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -1271,6 +1574,11 @@ int32_t MftH264EncoderImpl::DrainReadyOutput() {
 int32_t MftH264EncoderImpl::Encode(
     const VideoFrame& input_frame,
     const std::vector<VideoFrameType>* frame_types) {
+  if (RebuildDue()) {
+    const int32_t rebuilt = Rebuild();
+    if (rebuilt != WEBRTC_VIDEO_CODEC_OK)
+      return rebuilt;
+  }
   const int32_t result = EncodeFrame(input_frame, frame_types);
   if (result != WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE ||
       !retry_in_memory_.load(std::memory_order_relaxed))
@@ -1870,6 +2178,7 @@ int32_t MftH264EncoderImpl::ProcessEncodedOutput(
       }
     }
     progress_.OutputDelivered(GetTickCount64());
+    RecheckRate();
     const auto output_now = livekit::mft_now_us();
     livekit::mft_note_output(output_now);
     // Feeds the screen-share keyframe bound in Encode(). GOP IDRs count too,
@@ -1939,6 +2248,17 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
   const uint32_t new_target_bps = parameters.bitrate.GetSpatialLayerSum(0);
   const uint32_t new_framerate =
       static_cast<uint32_t>(parameters.framerate_fps);
+  if (vendor_ != Vendor::kAmd) {
+    if (new_target_bps == 0) {
+      sending_ = false;
+      return;
+    }
+    UpdateRate(new_target_bps, new_framerate);
+    if (!sending_)
+      key_frame_request_ = true;
+    sending_ = true;
+    return;
+  }
   const uint32_t bitrate_delta =
       new_target_bps > target_bps_
           ? new_target_bps - target_bps_
@@ -1969,6 +2289,8 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
         codec_api_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
     auto& diag = livekit::mft_diag();
     diag.flags.fetch_and(~(512u | 65536u), std::memory_order_relaxed);
+    diag.rate_asked.store(mft_bps, std::memory_order_relaxed);
+    diag.rate_reported.store(0, std::memory_order_relaxed);
     if (SUCCEEDED(hr)) {
       livekit::mft_diag_flag(256);
       if (mft_bps != new_target_bps)
@@ -1978,6 +2300,8 @@ void MftH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
       VariantInit(&actual);
       HRESULT read_hr =
           codec_api_->GetValue(&CODECAPI_AVEncCommonMeanBitRate, &actual);
+      if (SUCCEEDED(read_hr) && actual.vt == VT_UI4)
+        diag.rate_reported.store(actual.ulVal, std::memory_order_relaxed);
       if (SUCCEEDED(read_hr) && actual.vt == VT_UI4) {
         const uint32_t actual_delta = actual.ulVal > mft_bps
                                           ? actual.ulVal - mft_bps

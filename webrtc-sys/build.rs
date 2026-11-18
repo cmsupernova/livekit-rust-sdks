@@ -60,7 +60,7 @@ fn main() {
         rust_files.push("src/desktop_capturer.rs");
     }
 
-    // Hardware test of MFT texture input; never part of a normal build.
+    // Hardware tests of the MFT encoder; never part of a normal build.
     let mft_selftest = target_os == "windows" && env::var("CARGO_FEATURE_MFT_SELFTEST").is_ok();
     if mft_selftest {
         rust_files.push("src/mft_selftest.rs");

@@ -152,7 +152,8 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // 5 async unlock failed, 6 SetOutputType failed, 7 SetInputType failed,
 // 8 event generator unavailable, 9 begin/start streaming failed,
 // 10 initialized, 11 async feed timeout at runtime, 12 ProcessInput failed,
-// 13 rate control unavailable or a live bitrate update failed,
+// 13 rate control unavailable or a live bitrate update failed (with flag
+// 256: taken and not acted on; rate_asked and rate_reported say what),
 // 14 fatal runtime error, 15 sustained no-output stall requesting fallback.
 // Init/runtime failures
 // make production fall back to software; isolation arms remain fail-closed.
@@ -166,9 +167,13 @@ inline std::atomic<uint32_t>& nvenc_screen_profile() {
 // it, 4096 the screen-share min QP was raised to our floor, 8192 the MFT's own
 // min QP was already at or above it (neither: it could not report one),
 // 16384 the latest frame-sized CBR buffer (HRD) was accepted, 32768 its
-// readback was no larger than asked (accepted only: the MFT could not report
-// it, or clamped it up), 65536 the latest bitrate given to the MFT was scaled
-// up for frames arriving below the media type's rate.
+// readback was the size asked (accepted only: the MFT could not report it,
+// or kept another size), 65536 the latest bitrate given to the MFT was scaled
+// up for frames arriving below the media type's rate, 131072 the rate-control
+// mode is peak-constrained VBR (Intel; 32 and 64 then speak of that mode, and
+// no buffer is set, so 16384 and 32768 stay clear), 262144 the MFT does not
+// act on a live bitrate and each new target reopens the encoder, 524288 it
+// does not act on a live buffer resize and keeps the size it holds.
 //
 // D3D stages (texture input, see d3d_input_requested below), with what the
 // d3d hr field holds: 0 not requested or not a screen share; 1 no hardware
@@ -189,6 +194,14 @@ struct MftDiagCounters {
   std::atomic<uint32_t> flags{0};
   std::atomic<uint32_t> d3d_stage{0};
   std::atomic<uint32_t> d3d_hr{0};
+  // The latest mean bitrate given to the MFT and what it reported back, in
+  // bps, and the same for the frame-sized CBR buffer, in bytes. Reported is 0
+  // when the MFT could not say. A stage 13 with flag 256 set is a driver that
+  // took the update and reported something else: these say what.
+  std::atomic<uint32_t> rate_asked{0};
+  std::atomic<uint32_t> rate_reported{0};
+  std::atomic<uint32_t> hrd_asked{0};
+  std::atomic<uint32_t> hrd_reported{0};
 };
 
 inline MftDiagCounters& mft_diag() {
@@ -299,6 +312,21 @@ inline std::atomic<bool>& d3d_input_any_vendor() {
 inline std::atomic<bool>& d3d_input_fail_next() {
   static std::atomic<bool> fail{false};
   return fail;
+}
+
+// Tests only: treat every MFT as an unknown vendor's (CBR, a cap sized for
+// the ceiling), to run the paths for a driver that ignores live updates on
+// hardware that has its own.
+inline std::atomic<bool>& mft_test_unknown_vendor() {
+  static std::atomic<bool> unknown{false};
+  return unknown;
+}
+
+// Tests only: the classic enumeration starts at this candidate, to reach the
+// MFT of an adapter Windows does not list first.
+inline std::atomic<uint32_t>& mft_test_first_candidate() {
+  static std::atomic<uint32_t> first{0};
+  return first;
 }
 
 inline std::atomic<uint32_t>& screen_encoder_mode() {

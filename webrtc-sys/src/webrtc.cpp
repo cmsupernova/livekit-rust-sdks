@@ -282,6 +282,10 @@ livekit_ffi::MftDiag mft_diag_read() {
   out.flags = d.flags.load(std::memory_order_relaxed);
   out.d3d_stage = d.d3d_stage.load(std::memory_order_relaxed);
   out.d3d_hr = d.d3d_hr.load(std::memory_order_relaxed);
+  out.rate_asked = d.rate_asked.load(std::memory_order_relaxed);
+  out.rate_reported = d.rate_reported.load(std::memory_order_relaxed);
+  out.hrd_asked = d.hrd_asked.load(std::memory_order_relaxed);
+  out.hrd_reported = d.hrd_reported.load(std::memory_order_relaxed);
   return out;
 }
 
@@ -307,6 +311,10 @@ void screen_set_encoder_mode(uint32_t mode) {
   d.stage.store(0, std::memory_order_relaxed);
   d.hr.store(0, std::memory_order_relaxed);
   d.flags.fetch_and(3u, std::memory_order_relaxed);
+  d.rate_asked.store(0, std::memory_order_relaxed);
+  d.rate_reported.store(0, std::memory_order_relaxed);
+  d.hrd_asked.store(0, std::memory_order_relaxed);
+  d.hrd_reported.store(0, std::memory_order_relaxed);
   livekit::mft_d3d_stage(0, 0);
   // A previous share's encoder may still hold a claim while its connection
   // closes; this share's capturer must wait for its own encoder.

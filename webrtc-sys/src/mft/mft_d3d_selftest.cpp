@@ -1,8 +1,13 @@
-// Hardware test of MFT texture input, built only with the mft-selftest
-// feature. It runs the production encoder class against a real hardware MFT:
-// a few system-memory frames first (the capturer's first frames arrive before
-// texture input is on), then keyed-mutex NV12 textures produced on a second
-// device, and finally reads a texture back through ToI420().
+// Hardware tests of the MFT encoder, built only with the mft-selftest
+// feature. Both run the production encoder class against a real hardware MFT.
+//
+// Texture input: a few system-memory frames first (the capturer's first frames
+// arrive before texture input is on), then keyed-mutex NV12 textures produced
+// on a second device, and finally a texture read back through ToI420().
+//
+// Rate control: the encoder is opened low and walked through a run of live
+// targets on a picture that wants every bit, and each stretch reports what
+// its frames cost and what the MFT said about its rate and its buffer.
 
 #include "livekit/mft_d3d_selftest.h"
 
@@ -12,8 +17,10 @@
 #include <mftransform.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -351,6 +358,217 @@ MftD3dSelfTest mft_d3d_selftest(uint32_t adapter_ordinal,
         !D3D11TextureBuffer::Create(shared.Get(), handle, 6, r.adapter_luid, w + 2, h) &&
         !D3D11TextureBuffer::Create(shared.Get(), handle, 7, 0, w, h);
   }
+
+  MFShutdown();
+  if (SUCCEEDED(com))
+    CoUninitialize();
+  return r;
+}
+
+namespace {
+
+// Frame sizes per stretch of the rate test.
+class SizeCallback : public webrtc::EncodedImageCallback {
+ public:
+  Result OnEncodedImage(const webrtc::EncodedImage& image,
+                        const webrtc::CodecSpecificInfo*) override {
+    const bool key = image._frameType == webrtc::VideoFrameType::kVideoFrameKey;
+    sizes.push_back({static_cast<uint32_t>(image.size()), key});
+    return Result(Result::OK);
+  }
+  struct Frame {
+    uint32_t bytes;
+    bool key;
+  };
+  std::vector<Frame> sizes;
+};
+
+// Luma that every frame has to pay for: a slow gradient under low noise that
+// is different in each buffer. A low QP spends hundreds of kilobytes on the
+// noise and a high one quantizes it away, so the size of a frame is whatever
+// the rate control allowed and nothing else.
+webrtc::scoped_refptr<webrtc::NV12Buffer> NoiseFrame(int width, int height,
+                                                    uint32_t seed) {
+  auto buffer = webrtc::NV12Buffer::Create(width, height);
+  uint32_t state = seed * 2654435761u + 1;
+  uint8_t* luma = buffer->MutableDataY();
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      state ^= state << 13;
+      state ^= state >> 17;
+      state ^= state << 5;
+      const int noise = static_cast<int>(state % 25) - 12;
+      luma[y * buffer->StrideY() + x] =
+          static_cast<uint8_t>(96 + ((x + y) >> 4) % 64 + noise);
+    }
+  }
+  memset(buffer->MutableDataUV(), 128,
+         static_cast<size_t>(buffer->StrideUV()) * ((height + 1) / 2));
+  return buffer;
+}
+
+}  // namespace
+
+MftRateSelfTest mft_rate_selftest(uint32_t candidate,
+                                  bool unknown_vendor,
+                                  uint32_t ceiling_kbps,
+                                  uint32_t stretch,
+                                  uint32_t width,
+                                  uint32_t height) {
+  MftRateSelfTest r{};
+  r.init_result = -1000;
+  const int w = static_cast<int>(width);
+  const int h = static_cast<int>(height);
+
+  const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+
+  std::vector<webrtc::scoped_refptr<webrtc::NV12Buffer>> noise;
+  for (uint32_t i = 0; i < 6; ++i)
+    noise.push_back(NoiseFrame(w, h, i + 1));
+
+  // System memory in, the classic way: what a share gets on every adapter
+  // but AMD's.
+  livekit::d3d_input_failed().store(0);
+  livekit::d3d_input_reset();
+  livekit::d3d_input_requested().store(0);
+  livekit::mft_test_first_candidate().store(candidate);
+  livekit::mft_test_unknown_vendor().store(unknown_vendor);
+  auto& diag = livekit::mft_diag();
+  diag.flags.store(0);
+
+  webrtc::VideoCodec codec;
+  codec.codecType = webrtc::kVideoCodecH264;
+  codec.width = static_cast<uint16_t>(width);
+  codec.height = static_cast<uint16_t>(height);
+  codec.maxFramerate = 60;
+  // A resumed share on a slow link opens about here (field report, Nov 2026).
+  codec.startBitrate = 1000;
+  codec.minBitrate = 300;
+  codec.maxBitrate = ceiling_kbps;
+  codec.mode = webrtc::VideoCodecMode::kScreensharing;
+  codec.numberOfSimulcastStreams = 0;
+  const webrtc::VideoEncoder::Settings settings(
+      webrtc::VideoEncoder::Capabilities(false), 1, 1200);
+
+  webrtc::MftH264EncoderImpl encoder(webrtc::CreateEnvironment());
+  SizeCallback callback;
+  encoder.RegisterEncodeCompleteCallback(&callback);
+  r.init_result = encoder.InitEncode(&codec, settings);
+  r.encoder_name = encoder.GetEncoderInfo().implementation_name;
+
+  struct Step {
+    const char* name;
+    uint32_t kbps;  // 0: leave the rate the encoder was opened with
+    uint32_t fps;
+    uint32_t frames;
+    bool still = false;
+    // Every sixth frame moves the target between `kbps` and 15% above it.
+    bool wobble = false;
+  };
+  const Step steps[] = {
+      {"start-1M", 0, 60, 60},
+      {"up-8M", 8000, 60, 90},
+      {"up-20M", 20000, 60, 90},
+      {"down-2M", 2000, 60, 90},
+      {"slow-8M", 8000, 15, 45},
+      {"still-8M", 8000, 7, 28, true},
+      {"back-8M", 8000, 60, 90},
+      {"wobble-8M", 8000, 60, 120, false, true},
+  };
+
+  int64_t next_ts = 1000000;
+  uint32_t frame_index = 0;
+  for (const Step& step : steps) {
+    if (r.init_result != WEBRTC_VIDEO_CODEC_OK)
+      break;
+    MftRatePhase phase{};
+    phase.name = step.name;
+    phase.target_kbps = step.kbps ? step.kbps : codec.startBitrate;
+    phase.fps = step.fps;
+    auto set_rate = [&](uint32_t kbps) {
+      webrtc::VideoBitrateAllocation allocation;
+      allocation.SetBitrate(0, 0, kbps * 1000);
+      encoder.SetRates(webrtc::VideoEncoder::RateControlParameters(
+          allocation, static_cast<double>(step.fps)));
+    };
+    if (step.kbps)
+      set_rate(step.kbps);
+    phase.stage = diag.stage.load();
+    phase.hr = diag.hr.load();
+    phase.flags = diag.flags.load();
+    phase.rate_asked = diag.rate_asked.load();
+    phase.rate_reported = diag.rate_reported.load();
+    phase.hrd_asked = diag.hrd_asked.load();
+    phase.hrd_reported = diag.hrd_reported.load();
+
+    const size_t first = callback.sizes.size();
+    const uint32_t frames = step.frames * std::max<uint32_t>(1u, stretch);
+    for (uint32_t i = 0; i < frames; ++i) {
+      if (step.wobble && i % 6 == 3)
+        set_rate(i % 12 == 3 ? step.kbps * 23 / 20 : step.kbps);
+      const auto& buffer =
+          step.still ? noise[0] : noise[++frame_index % noise.size()];
+      const auto frame =
+          webrtc::VideoFrame::Builder()
+              .set_video_frame_buffer(buffer)
+              .set_timestamp_us(next_ts)
+              .set_rtp_timestamp(static_cast<uint32_t>(next_ts * 9 / 100))
+              .build();
+      next_ts += 1000000 / step.fps;
+      std::vector<webrtc::VideoFrameType> types{
+          webrtc::VideoFrameType::kVideoFrameDelta};
+      const auto before = std::chrono::steady_clock::now();
+      const int32_t result = encoder.Encode(frame, &types);
+      phase.encode_max_ms = std::max<uint32_t>(
+          phase.encode_max_ms,
+          static_cast<uint32_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - before)
+                  .count()));
+      if (result != WEBRTC_VIDEO_CODEC_OK && phase.first_error == 0)
+        phase.first_error = result;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000 / step.fps));
+    }
+
+    phase.end_stage = diag.stage.load();
+    phase.end_hr = diag.hr.load();
+    phase.end_flags = diag.flags.load();
+    phase.end_rate_asked = diag.rate_asked.load();
+    phase.end_rate_reported = diag.rate_reported.load();
+    phase.end_hrd_asked = diag.hrd_asked.load();
+    phase.end_hrd_reported = diag.hrd_reported.load();
+    phase.end_encoder = encoder.GetEncoderInfo().implementation_name;
+    // The last third, by when a rate taken through a rebuild is in too.
+    const size_t count = callback.sizes.size() - first;
+    const size_t late = first + count - count / 3;
+    uint64_t late_total = 0;
+    uint32_t late_frames = 0;
+    for (size_t i = first; i < callback.sizes.size(); ++i) {
+      const auto& f = callback.sizes[i];
+      ++phase.frames;
+      phase.total_bytes += f.bytes;
+      if (f.key) {
+        ++phase.key_frames;
+        phase.key_max_bytes = std::max(phase.key_max_bytes, f.bytes);
+        continue;
+      }
+      phase.delta_max_bytes = std::max(phase.delta_max_bytes, f.bytes);
+      if (i >= late) {
+        late_total += f.bytes;
+        ++late_frames;
+      }
+    }
+    phase.late_avg_bytes =
+        late_frames ? static_cast<uint32_t>(late_total / late_frames) : 0;
+    r.phases.push_back(std::move(phase));
+  }
+  encoder.Release();
+
+  livekit::mft_test_first_candidate().store(0);
+  livekit::mft_test_unknown_vendor().store(false);
+  livekit::d3d_input_failed().store(0);
+  livekit::d3d_input_failed_hr().store(0);
 
   MFShutdown();
   if (SUCCEEDED(com))

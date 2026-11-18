@@ -71,7 +71,22 @@ class MftH264EncoderImpl : public VideoEncoder {
                               uint64_t texture_adapter);
   bool ConfigureCodecBeforeMediaType();
   bool ReadBackRateControl();
+  // AMD: the cap at two frames of `target_bps` at `framerate`.
   void ApplyHrdBuffer(uint32_t target_bps, uint32_t framerate);
+  // The cap for `bps` at `fps`, in bytes.
+  uint32_t HrdBytesFor(uint64_t bps, uint32_t fps) const;
+  void OpenHrdBuffer();
+  bool SetHrdBytes(uint32_t size);
+  void HrdStuck();
+  // A live target for every MFT but AMD's (see SetRates).
+  void UpdateRate(uint32_t target_bps, uint32_t framerate);
+  int ReadRate(uint32_t mft_bps, uint32_t* reported);
+  void RecheckRate();
+  void RateConfirmed(uint32_t mft_bps, bool reported);
+  void RateStuck(uint32_t hr);
+  bool RebuildDue() const;
+  int32_t Rebuild();
+  int32_t InitEncodeAny(const VideoCodec* inst);
   // The mean bitrate to give the MFT for `target_bps` at the frame rate
   // frames actually arrive at.
   uint32_t MftBitrateFor(uint32_t target_bps, uint32_t framerate) const;
@@ -176,8 +191,26 @@ class MftH264EncoderImpl : public VideoEncoder {
   // the input rate; the media type keeps what it was configured with.
   uint32_t media_type_fps_ = 30;
   // The vendor's rate control gives each frame mean bitrate / media_type_fps_
-  // however fast frames arrive (AMD).
+  // however fast frames arrive (AMD, Intel).
   bool rate_from_media_fps_ = false;
+  enum class Vendor { kOther, kAmd, kIntel };
+  Vendor vendor_ = Vendor::kOther;
+  // eAVEncCommonRateControlMode in use: CBR, or peak-constrained VBR on Intel.
+  uint32_t rate_mode_ = 0;
+  // The cap the MFT holds, in bytes (0: none was set, or it took none).
+  uint32_t hrd_bytes_ = 0;
+  // The mean bitrate the MFT holds, and the one it was opened with.
+  uint32_t applied_bps_ = 0;
+  uint32_t built_bps_ = 0;
+  // Encoded frames left before a live bitrate is read back a second time.
+  int rate_recheck_ = 0;
+  // Learned about this MFT, and kept across a rebuild: it acts on a live
+  // bitrate, and on a live resize of the cap. Without the first a new target
+  // is taken by opening the encoder again.
+  bool rate_live_ = true;
+  bool hrd_live_ = true;
+  bool rebuild_wanted_ = false;
+  uint64_t last_build_us_ = 0;
   bool sending_ = false;
   bool key_frame_request_ = false;
   // mft_now_us() of the last keyframe output (or periodic keyframe request),
