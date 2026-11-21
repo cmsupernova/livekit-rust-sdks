@@ -21,13 +21,17 @@
 #include <string>
 
 #include "api/video/yuv_helper.h"
+#include "livekit/rtc_error.h"
 #include "webrtc-sys/src/yuv_helper.rs.h"
 
 namespace livekit_ffi {
 
+// BridgeException, not std::runtime_error: the message is a temporary, and
+// under _HAS_EXCEPTIONS=0 MSVC's runtime_error keeps only its pointer (see
+// rtc_error.h).
 #define THROW_ON_ERROR(ret)                                           \
   if (ret != 0) {                                                     \
-    throw std::runtime_error("libyuv error: " + std::to_string(ret)); \
+    throw BridgeException("libyuv error: " + std::to_string(ret));    \
   }
 
 static void i420_to_argb(const uint8_t* src_y,

@@ -61,7 +61,7 @@ void throw_error() {
   lk_error.has_sctp_cause_code = false;
   lk_error.sctp_cause_code = 0;
   lk_error.message = "exception is thrown!";
-  throw std::runtime_error(serialize_error(lk_error));
+  throw BridgeException(serialize_error(lk_error));
 }
 #endif
 

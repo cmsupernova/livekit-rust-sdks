@@ -87,7 +87,7 @@ RtpParameters RtpSender::get_parameters() const {
 void RtpSender::set_parameters(RtpParameters params) const {
   auto error = sender_->SetParameters(to_native_rtp_parameters(params));
   if (!error.ok())
-    throw std::runtime_error(serialize_error(to_error(error)));
+    throw BridgeException(serialize_error(to_error(error)));
 }
 
 void RtpSender::set_degradation_preference(bool has_value,
@@ -106,7 +106,7 @@ void RtpSender::set_degradation_preference(bool has_value,
   }
   auto error = sender_->SetParameters(params);
   if (!error.ok())
-    throw std::runtime_error(serialize_error(to_error(error)));
+    throw BridgeException(serialize_error(to_error(error)));
 }
 
 void RtpSender::set_encoding_max_bitrate(bool has_value,
@@ -131,7 +131,7 @@ void RtpSender::set_encoding_max_bitrate(bool has_value,
   }
   auto error = sender_->SetParameters(params);
   if (!error.ok())
-    throw std::runtime_error(serialize_error(to_error(error)));
+    throw BridgeException(serialize_error(to_error(error)));
 }
 
 }  // namespace livekit_ffi
