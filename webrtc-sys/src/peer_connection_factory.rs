@@ -24,6 +24,13 @@ use crate::{
 
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
+    #[repr(u8)]
+    enum TcpCandidatePolicy {
+        Default,
+        Enabled,
+        Disabled,
+    }
+
     pub struct CandidatePair {
         local: SharedPtr<Candidate>,
         remote: SharedPtr<Candidate>,
@@ -88,10 +95,23 @@ pub mod ffi {
         type PeerConnectionFactory;
 
         fn create_peer_connection_factory() -> SharedPtr<PeerConnectionFactory>;
+        fn create_peer_connection_factory_with_loopback_ice() -> SharedPtr<PeerConnectionFactory>;
+        fn create_peer_connection_factory_with_loopback_only_ice(
+        ) -> SharedPtr<PeerConnectionFactory>;
+        fn create_peer_connection_factory_with_consent_fenced_ice(
+        ) -> SharedPtr<PeerConnectionFactory>;
 
         fn create_peer_connection(
             self: &PeerConnectionFactory,
             config: RtcConfiguration,
+            observer: Box<PeerConnectionObserverWrapper>,
+        ) -> Result<SharedPtr<PeerConnection>>;
+
+        fn create_peer_connection_with_ice_options(
+            self: &PeerConnectionFactory,
+            config: RtcConfiguration,
+            tcp_candidate_policy: TcpCandidatePolicy,
+            enable_ice_renomination: bool,
             observer: Box<PeerConnectionObserverWrapper>,
         ) -> Result<SharedPtr<PeerConnection>>;
 

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "api/environment/environment_factory.h"
 #include "api/peer_connection_interface.h"
 #include "api/scoped_refptr.h"
@@ -40,13 +42,26 @@ struct RtcConfiguration;
 webrtc::PeerConnectionInterface::RTCConfiguration to_native_rtc_configuration(
     RtcConfiguration config);
 
+struct LoopbackIceListeners;
+class ConsentFencedIcePolicy;
+
+enum class IceNetworkPolicy { Default, IncludeLoopback, LoopbackOnly, ConsentFenced };
+
 class PeerConnectionFactory {
  public:
-  explicit PeerConnectionFactory(std::shared_ptr<RtcRuntime> rtc_runtime);
+  explicit PeerConnectionFactory(
+      std::shared_ptr<RtcRuntime> rtc_runtime,
+      IceNetworkPolicy ice_network_policy = IceNetworkPolicy::Default);
   ~PeerConnectionFactory();
 
   std::shared_ptr<PeerConnection> create_peer_connection(
       RtcConfiguration config,
+      rust::Box<PeerConnectionObserverWrapper> observer) const;
+
+  std::shared_ptr<PeerConnection> create_peer_connection_with_ice_options(
+      RtcConfiguration config,
+      TcpCandidatePolicy tcp_candidate_policy,
+      bool enable_ice_renomination,
       rust::Box<PeerConnectionObserverWrapper> observer) const;
 
   std::shared_ptr<VideoTrack> create_video_track(
@@ -68,7 +83,17 @@ class PeerConnectionFactory {
   webrtc::scoped_refptr<AudioDevice> audio_device_;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> peer_factory_;
   webrtc::Environment env_;
+  const IceNetworkPolicy ice_network_policy_;
+  const std::shared_ptr<LoopbackIceListeners> loopback_listeners_;
+  const std::shared_ptr<ConsentFencedIcePolicy> consent_ice_policy_;
+  mutable std::atomic<bool> private_connection_created_{false};
 };
 
 std::shared_ptr<PeerConnectionFactory> create_peer_connection_factory();
+std::shared_ptr<PeerConnectionFactory>
+create_peer_connection_factory_with_loopback_ice();
+std::shared_ptr<PeerConnectionFactory>
+create_peer_connection_factory_with_loopback_only_ice();
+std::shared_ptr<PeerConnectionFactory>
+create_peer_connection_factory_with_consent_fenced_ice();
 }  // namespace livekit_ffi

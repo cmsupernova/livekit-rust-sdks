@@ -123,6 +123,20 @@ pub struct PeerConnection {
 }
 
 impl PeerConnection {
+    /// Connects to a bound IPv4 passive ICE-TCP listener on this exact
+    /// loopback-only peer connection. Invoke from an application thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn dial_loopback_ice_listener(&self, port: u16) -> std::io::Result<std::net::TcpStream> {
+        self.handle.dial_loopback_ice_listener(port)
+    }
+
+    /// Applies the call owner's direct-route decision on the network sequence.
+    /// Returns false for an ordinary, strict-private, or closed connection.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_direct_ice_allowed(&self, allowed: bool) -> bool {
+        self.handle.set_direct_ice_allowed(allowed)
+    }
+
     pub fn set_configuration(&self, config: RtcConfiguration) -> Result<(), RtcError> {
         self.handle.set_configuration(config)
     }

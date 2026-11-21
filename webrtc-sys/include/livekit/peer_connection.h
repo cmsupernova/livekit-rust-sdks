@@ -43,6 +43,8 @@ webrtc::PeerConnectionInterface::RTCConfiguration to_native_rtc_configuration(
     RtcConfiguration config);
 
 class PeerConnectionObserverWrapper;
+struct LoopbackIceListeners;
+class ConsentFencedIcePolicy;
 
 class PeerConnection : webrtc::PeerConnectionObserver {
  public:
@@ -53,9 +55,19 @@ class PeerConnection : webrtc::PeerConnectionObserver {
 
   ~PeerConnection();
 
-  bool Initialize(webrtc::PeerConnectionInterface::RTCConfiguration config);
+  bool Initialize(webrtc::PeerConnectionInterface::RTCConfiguration config,
+                  std::shared_ptr<LoopbackIceListeners> loopback_listeners = nullptr,
+                  bool preserve_ice_options = false,
+                  std::shared_ptr<ConsentFencedIcePolicy> consent_ice_policy = nullptr);
 
   void set_configuration(RtcConfiguration config) const;
+
+  bool set_direct_ice_allowed(bool allowed) const;
+
+  bool with_loopback_ice_listener(
+      uint16_t port,
+      rust::Box<PeerContext> ctx,
+      rust::Fn<void(uint16_t, rust::Box<PeerContext>)> dial) const;
 
   void set_bitrate(int32_t min_bitrate_bps,
                    int32_t start_bitrate_bps,
@@ -202,6 +214,9 @@ class PeerConnection : webrtc::PeerConnectionObserver {
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> pc_factory_;
   rust::Box<PeerConnectionObserverWrapper> observer_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection_;
+  std::shared_ptr<LoopbackIceListeners> loopback_listeners_;
+  std::shared_ptr<ConsentFencedIcePolicy> consent_ice_policy_;
+  bool preserve_ice_options_ = false;
 };
 
 static std::shared_ptr<PeerConnection> _shared_peer_connection() {

@@ -16,6 +16,7 @@
 
 #include "livekit/peer_connection.h"
 #include "livekit/peer_connection_factory.h"
+#include "livekit/hybrid_ice.h"
 
 #include <memory>
 
@@ -87,8 +88,23 @@ PeerConnection::~PeerConnection() {
 }
 
 bool PeerConnection::Initialize(
-    webrtc::PeerConnectionInterface::RTCConfiguration config) {
+    webrtc::PeerConnectionInterface::RTCConfiguration config,
+    std::shared_ptr<LoopbackIceListeners> loopback_listeners,
+    bool preserve_ice_options,
+    std::shared_ptr<ConsentFencedIcePolicy> consent_ice_policy) {
   webrtc::PeerConnectionDependencies deps{this};
+  loopback_listeners_ = std::move(loopback_listeners);
+  consent_ice_policy_ = std::move(consent_ice_policy);
+  preserve_ice_options_ = preserve_ice_options;
+  if (consent_ice_policy_) {
+    std::set<webrtc::SocketAddress> stun_dns;
+    if (!ParseHybridIceServers(config.servers, stun_dns)) return false;
+    rtc_runtime_->network_thread()->BlockingCall(
+        [&] { consent_ice_policy_->SetStunDns(std::move(stun_dns)); });
+    deps.async_dns_resolver_factory = std::make_unique<FencedIceDnsFactory>(consent_ice_policy_);
+  } else if (loopback_listeners_) {
+    deps.async_dns_resolver_factory = std::make_unique<LoopbackIceDnsFactory>();
+  }
   auto result =
       pc_factory_->CreatePeerConnectionOrError(config, std::move(deps));
 
@@ -102,13 +118,148 @@ bool PeerConnection::Initialize(
 }
 
 void PeerConnection::set_configuration(RtcConfiguration config) const {
-  auto result =
-      peer_connection_->SetConfiguration(to_native_rtc_configuration(config));
+  auto native = to_native_rtc_configuration(std::move(config));
+  std::set<webrtc::SocketAddress> stun_dns;
+  if (loopback_listeners_) {
+    const bool valid_servers = consent_ice_policy_
+                                   ? ParseHybridIceServers(native.servers, stun_dns)
+                                   : native.servers.empty();
+    if (!valid_servers) {
+      throw BridgeException(serialize_error(to_error(webrtc::RTCError(
+          webrtc::RTCErrorType::INVALID_PARAMETER,
+          "Invalid ICE servers for the isolated peer connection"))));
+    }
+  }
+  bool renew_physical_ports = false;
+  if (preserve_ice_options_ || consent_ice_policy_) {
+    const auto previous = peer_connection_->GetConfiguration();
+    if (preserve_ice_options_) {
+      native.tcp_candidate_policy = previous.tcp_candidate_policy;
+      native.enable_ice_renomination = previous.enable_ice_renomination;
+    }
+    renew_physical_ports = consent_ice_policy_ && previous.servers != native.servers;
+  }
+  if (renew_physical_ports) {
+    // Close the old direct allocations before installing their replacement.
+    // Only the native consent owner can explicitly reopen the physical gate.
+    rtc_runtime_->network_thread()->BlockingCall(
+        [&] { consent_ice_policy_->SetAllowed(false); });
+  }
+  auto result = peer_connection_->SetConfiguration(native);
 
   if (!result.ok()) {
     throw BridgeException(serialize_error(to_error(result)));
   }
+  if (consent_ice_policy_) {
+    rtc_runtime_->network_thread()->BlockingCall(
+        [&] {
+          consent_ice_policy_->SetStunDns(std::move(stun_dns));
+        });
+  }
 }
+
+bool PeerConnection::set_direct_ice_allowed(bool allowed) const {
+  if (!consent_ice_policy_) return false;
+  return rtc_runtime_->network_thread()->BlockingCall([&] {
+    if (loopback_listeners_->retired) return false;
+    consent_ice_policy_->SetAllowed(allowed);
+    return true;
+  });
+}
+
+bool PeerConnection::with_loopback_ice_listener(
+    uint16_t port,
+    rust::Box<PeerContext> ctx,
+    rust::Fn<void(uint16_t, rust::Box<PeerContext>)> dial) const {
+  if (!loopback_listeners_ || port <= 9) return false;
+  // A socket cannot be retired or replaced while this sequence is checking and
+  // opening the OS TCP connection. The callback must use a short dial timeout.
+  return rtc_runtime_->network_thread()->BlockingCall([&] {
+    if (loopback_listeners_->retired) return false;
+    auto match = loopback_listeners_->sockets.find(port);
+    if (match == loopback_listeners_->sockets.end()) return false;
+    const auto* socket = match->second;
+    auto address = socket->GetLocalAddress();
+    if (socket->GetState() != webrtc::AsyncListenSocket::State::kBound ||
+        address.family() != AF_INET || !address.IsLoopbackIP() ||
+        address.port() != port) {
+      return false;
+    }
+    dial(port, std::move(ctx));
+    return true;
+  });
+}
+
+#ifdef LIVEKIT_ICE_CONSENT_SELFTEST
+namespace {
+struct FakeIceIo {
+  int closes = 0;
+  int sends = 0;
+};
+
+class FakeIceSocket final : public webrtc::Socket {
+ public:
+  explicit FakeIceSocket(FakeIceIo& io) : io_(io) {}
+  webrtc::SocketAddress GetLocalAddress() const override { return {"192.0.2.1", 1234}; }
+  webrtc::SocketAddress GetRemoteAddress() const override { return {"192.0.2.2", 2345}; }
+  int Bind(const webrtc::SocketAddress&) override { return 0; }
+  int Connect(const webrtc::SocketAddress&) override { return 0; }
+  int Send(const void*, size_t size) override { ++io_.sends; return static_cast<int>(size); }
+  int SendTo(const void* data, size_t size, const webrtc::SocketAddress&) override { return Send(data, size); }
+  int Recv(void*, size_t, int64_t*) override { return -1; }
+  int Listen(int) override { return 0; }
+  webrtc::Socket* Accept(webrtc::SocketAddress* address) override {
+    *address = GetRemoteAddress();
+    return new FakeIceSocket(io_);
+  }
+  int Close() override { ++io_.closes; return 0; }
+  int GetError() const override { return error_; }
+  void SetError(int error) override { error_ = error; }
+  ConnState GetState() const override { return CS_CONNECTED; }
+  int GetOption(Option, int*) override { return 0; }
+  int SetOption(Option, int) override { return 0; }
+
+ private:
+  FakeIceIo& io_;
+  int error_ = 0;
+};
+}  // namespace
+
+extern "C" bool livekit_test_fenced_ice_accepted_socket_epoch() {
+  auto policy = std::make_shared<ConsentFencedIcePolicy>();
+  const webrtc::SocketAddress stun("stun.example", 3478);
+  const webrtc::SocketAddress turns("turn.example", 443);
+  webrtc::SocketAddress resolved;
+  if (!PreserveIceServerHostname(turns, {"192.0.2.3", 443}, &resolved) ||
+      resolved.hostname() != "turn.example" || resolved.IsUnresolvedIP() ||
+      PreserveIceServerHostname(turns, {"127.0.0.1", 443}, &resolved) ||
+      PreserveIceServerHostname(turns, {"192.0.2.3", 3478}, &resolved)) return false;
+  policy->SetStunDns({stun, turns});
+  if (policy->allowed() || policy->AllowsStunDns(stun, policy->epoch())) return false;
+  policy->SetAllowed(true);
+  const uint64_t old_epoch = policy->epoch();
+  if (!policy->AllowsStunDns(stun, old_epoch) || !policy->AllowsStunDns(turns, old_epoch) ||
+      policy->AllowsStunDns({"other.example", 3478}, old_epoch) ||
+      policy->AllowsStunDns({"turn.example", 3478}, old_epoch)) return false;
+  FakeIceIo io;
+  FencedIceSocket listener(std::make_unique<FakeIceSocket>(io), policy, policy->epoch());
+  auto accepted = std::unique_ptr<webrtc::Socket>(listener.Accept(nullptr));
+  if (!accepted || accepted->Send("x", 1) != 1) return false;
+  bool fenced_before_close = false;
+  accepted->SubscribeCloseEvent(&fenced_before_close, [&](webrtc::Socket* socket, int) {
+    fenced_before_close = !policy->allowed() && socket->Send("y", 1) == -1;
+  });
+  policy->SetAllowed(false);
+  if (io.closes != 2 || !fenced_before_close || accepted->GetState() != webrtc::Socket::CS_CLOSED) return false;
+  policy->SetAllowed(true);
+  if (accepted->Send("y", 1) != -1 || listener.Accept(nullptr) || io.sends != 1 ||
+      policy->AllowsStunDns(stun, old_epoch) || !policy->AllowsStunDns(stun, policy->epoch())) return false;
+  policy->SetStunDns({});
+  if (policy->AllowsStunDns(stun, policy->epoch())) return false;
+  FencedIceSocket current(std::make_unique<FakeIceSocket>(io), policy, policy->epoch());
+  return current.Send("z", 1) == 1 && io.sends == 2;
+}
+#endif
 
 void PeerConnection::set_bitrate(int32_t min_bitrate_bps,
                                  int32_t start_bitrate_bps,
@@ -361,6 +512,12 @@ IceConnectionState PeerConnection::ice_connection_state() const {
 }
 
 void PeerConnection::close() const {
+  if (loopback_listeners_) {
+    rtc_runtime_->network_thread()->BlockingCall([&] {
+      loopback_listeners_->retired = true;
+      if (consent_ice_policy_) consent_ice_policy_->SetAllowed(false);
+    });
+  }
   peer_connection_->Close();
 }
 

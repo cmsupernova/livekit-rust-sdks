@@ -131,6 +131,15 @@ pub mod ffi {
 
         fn set_configuration(self: &PeerConnection, config: RtcConfiguration) -> Result<()>;
 
+        fn set_direct_ice_allowed(self: &PeerConnection, allowed: bool) -> bool;
+
+        fn with_loopback_ice_listener(
+            self: &PeerConnection,
+            port: u16,
+            ctx: Box<PeerContext>,
+            dial: fn(port: u16, ctx: Box<PeerContext>),
+        ) -> bool;
+
         fn set_bitrate(
             self: &PeerConnection,
             min_bitrate_bps: i32,
@@ -221,6 +230,19 @@ pub struct PeerContext(pub Box<dyn Any + Send>);
 
 // https://webrtc.github.io/webrtc-org/native-code/native-apis/
 impl_thread_safety!(ffi::PeerConnection, Send + Sync);
+
+#[cfg(all(test, feature = "ice-consent-selftest"))]
+mod consent_tests {
+    unsafe extern "C" {
+        fn livekit_test_fenced_ice_accepted_socket_epoch() -> bool;
+    }
+
+    #[test]
+    fn accepted_physical_socket_cannot_reopen_across_consent_epochs() {
+        // The fixture operates only on fake sockets and returns a boolean.
+        assert!(unsafe { livekit_test_fenced_ice_accepted_socket_epoch() });
+    }
+}
 
 impl Default for ffi::RtcOfferAnswerOptions {
     // static const int kUndefined = -1;

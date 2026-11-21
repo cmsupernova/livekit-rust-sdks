@@ -184,6 +184,10 @@ impl PeerConnection {
         Self { sys_handle, observer }
     }
 
+    pub fn set_direct_ice_allowed(&self, allowed: bool) -> bool {
+        self.sys_handle.set_direct_ice_allowed(allowed)
+    }
+
     pub fn set_configuration(&self, config: RtcConfiguration) -> Result<(), RtcError> {
         let res = self.sys_handle.set_configuration(config.into());
 
@@ -378,6 +382,32 @@ impl PeerConnection {
             Ok(()) => Ok(()),
             Err(e) => unsafe { Err(sys_err::ffi::RtcError::from(e.what()).into()) },
         }
+    }
+
+    pub fn dial_loopback_ice_listener(&self, port: u16) -> std::io::Result<std::net::TcpStream> {
+        use std::{
+            io::{Error, ErrorKind, Result},
+            net::{Ipv4Addr, SocketAddrV4, TcpStream},
+            time::Duration,
+        };
+
+        type DialResult = Arc<Mutex<Option<Result<TcpStream>>>>;
+        let result: DialResult = Arc::new(Mutex::new(None));
+        let admitted = self.sys_handle.with_loopback_ice_listener(
+            port,
+            Box::new(sys_pc::PeerContext(Box::new(result.clone()))),
+            |port, context| {
+                let Some(result) = context.0.downcast_ref::<DialResult>() else { return };
+                let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+                *result.lock() =
+                    Some(TcpStream::connect_timeout(&address.into(), Duration::from_millis(250)));
+            },
+        );
+        if !admitted {
+            return Err(Error::new(ErrorKind::PermissionDenied, "ICE listener is unavailable"));
+        }
+        let opened = result.lock().take();
+        opened.unwrap_or_else(|| Err(Error::other("ICE listener dial did not complete")))
     }
 
     pub fn close(&self) {

@@ -15,6 +15,7 @@
  */
 
 #include "livekit/peer_connection_factory.h"
+#include "livekit/hybrid_ice.h"
 
 #include <memory>
 #include <utility>
@@ -39,6 +40,7 @@
 #include "livekit/video_decoder_factory.h"
 #include "livekit/video_encoder_factory.h"
 #include "livekit/webrtc.h"
+#include "rtc_base/network_constants.h"
 #include "rtc_base/thread.h"
 #include "webrtc-sys/src/peer_connection.rs.h"
 #include "webrtc-sys/src/peer_connection_factory.rs.h"
@@ -48,9 +50,17 @@ namespace livekit_ffi {
 class PeerConnectionObserver;
 
 PeerConnectionFactory::PeerConnectionFactory(
-    std::shared_ptr<RtcRuntime> rtc_runtime)
+    std::shared_ptr<RtcRuntime> rtc_runtime, IceNetworkPolicy ice_network_policy)
     : rtc_runtime_(rtc_runtime),
-    env_(webrtc::EnvironmentFactory().Create()) {
+      env_(webrtc::EnvironmentFactory().Create()),
+      ice_network_policy_(ice_network_policy),
+      loopback_listeners_(ice_network_policy == IceNetworkPolicy::LoopbackOnly ||
+                                  ice_network_policy == IceNetworkPolicy::ConsentFenced
+                              ? std::make_shared<LoopbackIceListeners>()
+                              : nullptr),
+      consent_ice_policy_(ice_network_policy == IceNetworkPolicy::ConsentFenced
+                              ? std::make_shared<ConsentFencedIcePolicy>()
+                              : nullptr) {
   RTC_LOG(LS_VERBOSE) << "PeerConnectionFactory::PeerConnectionFactory()";
 
   webrtc::PeerConnectionFactoryDependencies dependencies;
@@ -58,6 +68,17 @@ PeerConnectionFactory::PeerConnectionFactory(
   dependencies.worker_thread = rtc_runtime_->worker_thread();
   dependencies.signaling_thread = rtc_runtime_->signaling_thread();
   dependencies.socket_factory = rtc_runtime_->network_thread()->socketserver();
+  if (consent_ice_policy_) {
+    dependencies.network_manager = std::make_unique<HybridIceNetworkManager>(
+        env_, dependencies.socket_factory, consent_ice_policy_);
+    dependencies.packet_socket_factory = std::make_unique<HybridIcePacketSocketFactory>(
+        dependencies.socket_factory, loopback_listeners_, consent_ice_policy_);
+  } else if (loopback_listeners_) {
+    dependencies.network_manager = std::make_unique<LoopbackIceNetworkManager>();
+    dependencies.packet_socket_factory =
+        std::make_unique<LoopbackIcePacketSocketFactory>(
+            dependencies.socket_factory, loopback_listeners_);
+  }
   dependencies.event_log_factory = std::make_unique<webrtc::RtcEventLogFactory>();
   // TODO:
   // dependencies.trials = std::make_unique<webrtc::FieldTrialBasedConfig>();
@@ -84,6 +105,12 @@ PeerConnectionFactory::PeerConnectionFactory(
     RTC_LOG_ERR(LS_ERROR) << "Failed to create PeerConnectionFactory";
     return;
   }
+
+  if (ice_network_policy_ != IceNetworkPolicy::Default) {
+    webrtc::PeerConnectionFactoryInterface::Options options;
+    options.network_ignore_mask &= ~webrtc::ADAPTER_TYPE_LOOPBACK;
+    peer_factory_->SetOptions(options);
+  }
 }
 
 PeerConnectionFactory::~PeerConnectionFactory() {
@@ -97,10 +124,45 @@ PeerConnectionFactory::~PeerConnectionFactory() {
 std::shared_ptr<PeerConnection> PeerConnectionFactory::create_peer_connection(
     RtcConfiguration config,
     rust::Box<PeerConnectionObserverWrapper> observer) const {
+  return create_peer_connection_with_ice_options(
+      std::move(config), TcpCandidatePolicy::Default, false, std::move(observer));
+}
+
+std::shared_ptr<PeerConnection>
+PeerConnectionFactory::create_peer_connection_with_ice_options(
+    RtcConfiguration config,
+    TcpCandidatePolicy tcp_candidate_policy,
+    bool enable_ice_renomination,
+    rust::Box<PeerConnectionObserverWrapper> observer) const {
+  auto native = to_native_rtc_configuration(std::move(config));
+  using Interface = webrtc::PeerConnectionInterface;
+  if (tcp_candidate_policy == TcpCandidatePolicy::Enabled) {
+    native.tcp_candidate_policy = Interface::kTcpCandidatePolicyEnabled;
+  } else if (tcp_candidate_policy == TcpCandidatePolicy::Disabled) {
+    native.tcp_candidate_policy = Interface::kTcpCandidatePolicyDisabled;
+  }
+  if (enable_ice_renomination) {
+    native.enable_ice_renomination = true;
+  }
+  if (loopback_listeners_) {
+    std::set<webrtc::SocketAddress> stun_dns;
+    const bool valid_servers = consent_ice_policy_
+                                   ? ParseHybridIceServers(native.servers, stun_dns)
+                                   : native.servers.empty();
+    if (!valid_servers || private_connection_created_.exchange(true)) {
+      throw BridgeException(serialize_error(to_error(webrtc::RTCError(
+          webrtc::RTCErrorType::INVALID_PARAMETER,
+          "Invalid ICE servers or duplicate isolated peer connection"))));
+    }
+  }
   std::shared_ptr<PeerConnection> pc = std::make_shared<PeerConnection>(
       rtc_runtime_, peer_factory_, std::move(observer));
 
-  if (!pc->Initialize(to_native_rtc_configuration(config))) {
+  if (!pc->Initialize(std::move(native),
+                      loopback_listeners_,
+                      tcp_candidate_policy != TcpCandidatePolicy::Default ||
+                          enable_ice_renomination,
+                      consent_ice_policy_)) {
     throw BridgeException(serialize_error(to_error(webrtc::RTCError(
         webrtc::RTCErrorType::INTERNAL_ERROR, "failed to initialize pc"))));
   }
@@ -138,6 +200,24 @@ RtpCapabilities PeerConnectionFactory::rtp_receiver_capabilities(
 
 std::shared_ptr<PeerConnectionFactory> create_peer_connection_factory() {
   return std::make_shared<PeerConnectionFactory>(RtcRuntime::create());
+}
+
+std::shared_ptr<PeerConnectionFactory>
+create_peer_connection_factory_with_loopback_ice() {
+  return std::make_shared<PeerConnectionFactory>(
+      RtcRuntime::create(), IceNetworkPolicy::IncludeLoopback);
+}
+
+std::shared_ptr<PeerConnectionFactory>
+create_peer_connection_factory_with_loopback_only_ice() {
+  return std::make_shared<PeerConnectionFactory>(
+      RtcRuntime::create(), IceNetworkPolicy::LoopbackOnly);
+}
+
+std::shared_ptr<PeerConnectionFactory>
+create_peer_connection_factory_with_consent_fenced_ice() {
+  return std::make_shared<PeerConnectionFactory>(
+      RtcRuntime::create(), IceNetworkPolicy::ConsentFenced);
 }
 
 }  // namespace livekit_ffi

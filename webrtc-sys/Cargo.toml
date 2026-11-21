@@ -9,6 +9,7 @@ repository.workspace = true
 
 [features]
 default = []
+ice-consent-selftest = []
 # Windows: builds the hardware tests of the MFT encoder, texture input
 # (tests/mft_d3d.rs) and live rate control (tests/mft_rate.rs).
 mft-selftest = []

@@ -84,8 +84,55 @@ impl PeerConnectionFactory {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl PeerConnectionFactory {
+    /// Creates a dedicated native factory whose ICE allocator can use loopback adapters.
+    /// This allows loopback in addition to the otherwise permitted interfaces.
+    pub fn with_loopback_ice() -> Self {
+        Self { handle: imp_pcf::PeerConnectionFactory::with_loopback_ice() }
+    }
+
+    /// Creates one native peer connection restricted to numeric loopback ICE-TCP.
+    /// UDP, DNS resolution and configured STUN/TURN servers are disabled.
+    pub fn with_loopback_only_ice() -> Self {
+        Self { handle: imp_pcf::PeerConnectionFactory::with_loopback_only_ice() }
+    }
+
+    /// Creates one native peer connection that starts with only loopback ICE-TCP.
+    /// Its owner can add or withdraw numeric direct host routes without replacing
+    /// the connection. Only configured STUN/TURN hostnames can resolve while
+    /// direct ICE is allowed.
+    pub fn with_consent_fenced_ice() -> Self {
+        Self { handle: imp_pcf::PeerConnectionFactory::with_consent_fenced_ice() }
+    }
+
+    /// Creates a native peer connection with optional TCP gathering and ICE renomination policy.
+    pub fn create_peer_connection_with_ice_options(
+        &self,
+        config: RtcConfiguration,
+        ice: native::RtcIceOptions,
+    ) -> Result<PeerConnection, RtcError> {
+        self.handle.create_peer_connection_with_ice_options(config, ice)
+    }
+}
+
 pub mod native {
     use super::PeerConnectionFactory;
+
+    #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+    pub enum TcpCandidatePolicy {
+        #[default]
+        Default,
+        Enabled,
+        Disabled,
+    }
+
+    /// Opt-in ICE policy for native peer connections.
+    #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+    pub struct RtcIceOptions {
+        pub tcp_candidate_policy: TcpCandidatePolicy,
+        pub enable_ice_renomination: bool,
+    }
     use crate::{
         audio_source::native::NativeAudioSource, audio_track::RtcAudioTrack,
         video_source::native::NativeVideoSource, video_track::RtcVideoTrack,

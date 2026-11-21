@@ -67,6 +67,9 @@ fn main() {
     }
 
     let mut builder = cxx_build::bridges(rust_files);
+    if env::var("CARGO_FEATURE_ICE_CONSENT_SELFTEST").is_ok() {
+        builder.define("LIVEKIT_ICE_CONSENT_SELFTEST", None);
+    }
 
     builder.files(&[
         "src/peer_connection.cpp",
